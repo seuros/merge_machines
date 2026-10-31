@@ -40,6 +40,18 @@ module MergeMachines
       assert_equal Timestamp.new(wall: AHEAD, counter: 5), clock.observe(wall: AHEAD, counter: 2)
     end
 
+    def test_a_counter_with_nothing_left_refuses_to_reissue_its_last_stamp
+      clock = HybridClock.new(replica: 1)
+      last = (2**64) - 1
+      full = Timestamp.new(wall: AHEAD, counter: last)
+
+      assert_equal full, clock.observe(wall: AHEAD, counter: last - 1)
+      assert_raises(Exhausted) { clock.tick(wall: AHEAD) }
+      assert_raises(Exhausted) { clock.observe(wall: AHEAD, counter: 1) }
+      assert_equal full, clock.now
+      assert_equal Timestamp.new(wall: LATER, counter: 0), clock.tick(wall: LATER)
+    end
+
     def test_a_blob_round_trips_the_last_timestamp_and_the_replica
       clock = HybridClock.new(replica: 7)
       clock.tick(wall: AHEAD)

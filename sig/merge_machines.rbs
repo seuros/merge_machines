@@ -19,7 +19,8 @@ module MergeMachines
   class Full < Error
   end
 
-  # Raised when a clock has issued the last stamp its counter can hold.
+  # Raised when a clock has issued the last stamp its counter can hold, by
+  # either clock.
   class Exhausted < Error
   end
 
@@ -220,11 +221,14 @@ module MergeMachines
     def now: () -> Timestamp
 
     # Stamps a local event at `wall`, in seconds, defaulting to the realtime
-    # clock's reading.
+    # clock's reading. Raises `Exhausted` when the reading has not advanced and
+    # the counter that separates two events at one reading holds its highest
+    # value, which leaves the clock where it was.
     def tick: (?wall: Float) -> Timestamp
 
     # Stamps the receipt of the timestamp `wall` and `counter` name, at the
-    # realtime clock's reading.
+    # realtime clock's reading. Raises `Exhausted` when it cannot be stamped
+    # after the timestamp observed.
     def observe: (wall: Float, counter: Integer) -> Timestamp
 
     def dump: () -> String

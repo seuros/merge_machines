@@ -1,6 +1,9 @@
 //! A hybrid logical clock: timestamps near physical time that still order.
 
-use crate::{CodecError, FIELD_LEN, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN, read_u64};
+use crate::{
+    ClockExhausted, CodecError, FIELD_LEN, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN,
+    read_u64,
+};
 
 /// Bytes a [`HybridTimestamp`] occupies in a frame.
 const TIMESTAMP_LEN: usize = 2 * FIELD_LEN;
@@ -54,26 +57,32 @@ impl Stamp for HybridTimestamp {
 /// in here produces timestamps that no other machine can order against its own.
 ///
 /// ```
-/// use merge_machines::HybridClock;
+/// use merge_machines::{ClockExhausted, HybridClock, HybridTimestamp};
 ///
 /// const MS: u64 = 1_000_000;
 /// let mut clock = HybridClock::new();
 ///
-/// let first = clock.tick(10 * MS);
+/// let first = clock.tick(10 * MS)?;
 /// assert_eq!(first.counter, 0);
 ///
 /// // Same reading twice: the counter separates them.
-/// let second = clock.tick(10 * MS);
+/// let second = clock.tick(10 * MS)?;
 /// assert!(second > first);
 ///
 /// // The wall clock is corrected backwards; the timestamps are not.
-/// let third = clock.tick(4 * MS);
+/// let third = clock.tick(4 * MS)?;
 /// assert!(third > second);
 /// assert_eq!(third.wall_ns, 10 * MS);
 ///
 /// // A reading that really did advance resets the counter.
-/// let fourth = clock.tick(11 * MS);
+/// let fourth = clock.tick(11 * MS)?;
 /// assert_eq!(fourth.counter, 0);
+///
+/// // A counter with nothing left reports it instead of repeating itself.
+/// let crowded = HybridTimestamp { wall_ns: 11 * MS, counter: u64::MAX };
+/// assert_eq!(clock.observe(0, crowded), Err(ClockExhausted));
+/// assert_eq!(clock.last(), fourth);
+/// # Ok::<(), ClockExhausted>(())
 /// ```
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HybridClock {
@@ -102,36 +111,57 @@ impl HybridClock {
     }
 
     /// Stamps a local event at wall-clock reading `wall_ns`.
-    pub const fn tick(&mut self, wall_ns: u64) -> HybridTimestamp {
+    ///
+    /// # Errors
+    ///
+    /// [`ClockExhausted`] when the reading has not advanced and the counter
+    /// that separates two events at the same reading holds its highest value,
+    /// which leaves the clock where it was.
+    pub const fn tick(&mut self, wall_ns: u64) -> Result<HybridTimestamp, ClockExhausted> {
         if wall_ns > self.last.wall_ns {
             self.last = HybridTimestamp {
                 wall_ns,
                 counter: 0,
             };
-        } else {
-            self.last.counter = self.last.counter.saturating_add(1);
+            return Ok(self.last);
         }
-        self.last
+        let Some(counter) = self.last.counter.checked_add(1) else {
+            return Err(ClockExhausted);
+        };
+        self.last.counter = counter;
+        Ok(self.last)
     }
 
     /// Stamps the receipt of `observed` at wall-clock reading `wall_ns`.
-    pub const fn observe(&mut self, wall_ns: u64, observed: HybridTimestamp) -> HybridTimestamp {
+    ///
+    /// # Errors
+    ///
+    /// The same as [`tick`](Self::tick), and the observed timestamp is not
+    /// adopted either.
+    pub const fn observe(
+        &mut self,
+        wall_ns: u64,
+        observed: HybridTimestamp,
+    ) -> Result<HybridTimestamp, ClockExhausted> {
         let latest = larger(wall_ns, larger(self.last.wall_ns, observed.wall_ns));
         let counter = if latest == self.last.wall_ns && latest == observed.wall_ns {
-            larger(self.last.counter, observed.counter).saturating_add(1)
+            larger(self.last.counter, observed.counter).checked_add(1)
         } else if latest == self.last.wall_ns {
-            self.last.counter.saturating_add(1)
+            self.last.counter.checked_add(1)
         } else if latest == observed.wall_ns {
-            observed.counter.saturating_add(1)
+            observed.counter.checked_add(1)
         } else {
-            0
+            Some(0)
+        };
+        let Some(counter) = counter else {
+            return Err(ClockExhausted);
         };
 
         self.last = HybridTimestamp {
             wall_ns: latest,
             counter,
         };
-        self.last
+        Ok(self.last)
     }
 
     /// Length of the [`encode`](Self::encode) frame.

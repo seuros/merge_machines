@@ -159,6 +159,10 @@ clock.observe(wall: 1.5, counter: 3)    # a timestamp that arrived
 clock.now                               # the last one issued
 ```
 
+It raises `MergeMachines::Exhausted` too, when the reading has not advanced and
+the counter that separates two events at one reading has nothing left. A
+reading that really did advance resets that counter.
+
 ### The reading it wants is not a monotonic one
 
 `wall:` is physical time two machines can compare, and defaults to

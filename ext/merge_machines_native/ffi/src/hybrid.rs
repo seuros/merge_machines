@@ -9,7 +9,7 @@ use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prel
 use merge_machines::{HybridClock, ReplicaId};
 
 use crate::data::{stamped, timestamp};
-use crate::{codec_error, optional_kwarg, required_kwarg, trailing_replica, wall};
+use crate::{codec_error, exhausted, optional_kwarg, required_kwarg, trailing_replica, wall};
 
 /// A clock and the replica whose events it stamps, which the core does not
 /// hold.
@@ -59,7 +59,7 @@ impl Wrapper {
             None => wall::now_ns(ruby)?,
         };
         let issued = rb_self.clock.borrow_mut().tick(wall_ns);
-        timestamp(ruby, issued)
+        timestamp(ruby, exhausted(ruby, issued)?)
     }
 
     /// Stamps the receipt of the timestamp `wall:` and `counter:` name, at the
@@ -71,7 +71,7 @@ impl Wrapper {
         let now = wall::now_ns(ruby)?;
         let observed = stamped(wall, counter);
         let issued = rb_self.clock.borrow_mut().observe(now, observed);
-        timestamp(ruby, issued)
+        timestamp(ruby, exhausted(ruby, issued)?)
     }
 
     /// The core frame followed by the replica id, 64-bit little-endian.

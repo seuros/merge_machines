@@ -82,19 +82,28 @@ since the Unix epoch. It is **not** a monotonic reading, and nothing derived
 from it is a deadline, a timeout or a budget: measuring elapsed time is the
 monotonic clock's job, and this crate has no business with it.
 
+A counter with nothing left reports `ClockExhausted` here too, rather than
+handing out a timestamp it already gave away.
+
 ```rust
-use merge_machines::HybridClock;
+use merge_machines::{ClockExhausted, HybridClock, HybridTimestamp};
 
 const MS: u64 = 1_000_000;
 let mut clock = HybridClock::new();
 
-let before = clock.tick(1_000 * MS);
-let during = clock.tick(1_000 * MS);
-let after = clock.tick(400 * MS);
+let before = clock.tick(1_000 * MS)?;
+let during = clock.tick(1_000 * MS)?;
+let after = clock.tick(400 * MS)?;
 
 assert!(during > before);
 assert!(after > during);
 assert_eq!(after.wall_ns, 1_000 * MS);
+
+let crowded = HybridTimestamp { wall_ns: 1_000 * MS, counter: u64::MAX };
+assert_eq!(clock.observe(400 * MS, crowded), Err(ClockExhausted));
+assert_eq!(clock.last(), after);
+
+Ok::<(), ClockExhausted>(())
 ```
 
 ## One value, last writer wins

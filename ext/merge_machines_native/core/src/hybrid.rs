@@ -1,5 +1,19 @@
 //! A hybrid logical clock: timestamps near physical time that still order.
 
+use crate::{CodecError, FIELD_LEN, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN, read_u64};
+
+/// Bytes a [`HybridTimestamp`] occupies in a frame.
+const TIMESTAMP_LEN: usize = 2 * FIELD_LEN;
+
+/// Where the wall-clock reading sits in a timestamp field.
+const WALL: core::ops::Range<usize> = 0..FIELD_LEN;
+
+/// Where the counter sits in a timestamp field.
+const COUNTER: core::ops::Range<usize> = FIELD_LEN..TIMESTAMP_LEN;
+
+/// Where the last timestamp issued sits in a clock frame.
+const LAST: core::ops::Range<usize> = TAG_LEN..TAG_LEN + TIMESTAMP_LEN;
+
 /// A wall-clock reading paired with a counter that breaks its ties.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HybridTimestamp {
@@ -7,6 +21,23 @@ pub struct HybridTimestamp {
     pub wall_ns: u64,
     /// How many timestamps have been issued at this reading.
     pub counter: u64,
+}
+
+impl Stamp for HybridTimestamp {
+    const KIND: u8 = STAMP_HYBRID;
+    const ENCODED_LEN: usize = TIMESTAMP_LEN;
+
+    fn write(self, field: &mut [u8]) {
+        field[WALL].copy_from_slice(&self.wall_ns.to_le_bytes());
+        field[COUNTER].copy_from_slice(&self.counter.to_le_bytes());
+    }
+
+    fn read(field: &[u8]) -> Self {
+        Self {
+            wall_ns: read_u64(&field[WALL]),
+            counter: read_u64(&field[COUNTER]),
+        }
+    }
 }
 
 /// Issues timestamps that track physical time without ever going backwards.
@@ -101,6 +132,68 @@ impl HybridClock {
             counter,
         };
         self.last
+    }
+
+    /// Length of the [`encode`](Self::encode) frame.
+    pub const ENCODED_LEN: usize = TAG_LEN + TIMESTAMP_LEN;
+
+    /// Writes the clock into `out`, returning the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `out` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        self.write_frame(frame);
+        Ok(Self::ENCODED_LEN)
+    }
+
+    /// The clock's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
+        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
+        self.write_frame(&mut frame);
+        frame
+    }
+
+    /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    fn write_frame(&self, frame: &mut [u8]) {
+        frame[TAG] = TAG_HYBRID_CLOCK;
+        self.last.write(&mut frame[LAST]);
+    }
+
+    /// Reads a clock written by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
+    /// when it holds another structure.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut clock = Self::new();
+        clock.decode_into(bytes)?;
+        Ok(clock)
+    }
+
+    /// Reads a frame over a clock the caller already holds.
+    ///
+    /// The clock is untouched when the frame is rejected.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`decode`](Self::decode).
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        if frame[TAG] != TAG_HYBRID_CLOCK {
+            return Err(CodecError::Tag);
+        }
+        self.last = HybridTimestamp::read(&frame[LAST]);
+        Ok(())
     }
 }
 

@@ -21,6 +21,16 @@
 //!
 //! State is fixed-size: capacities are const generics, and a state with no free
 //! slot left reports [`CapacityError`] rather than allocating.
+//!
+//! # Putting state on a wire
+//!
+//! Every state encodes to a fixed-length frame of its own
+//! `ENCODED_LEN` bytes, led by a tag naming the structure and, where there is
+//! one, a field naming the const generic. `decode` and `decode_into` reject a
+//! short buffer, another structure's tag, and a frame written at another shape.
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 /// Compiles and runs the README's examples as doctests.
 #[cfg(doctest)]
@@ -39,7 +49,7 @@ pub use gcounter::GCounter;
 pub use gset::GSet;
 pub use hybrid::{HybridClock, HybridTimestamp};
 pub use logical::LogicalClock;
-pub use lww::LwwRegister;
+pub use lww::{LwwRegister, STAMP_HYBRID, STAMP_LOGICAL, Stamp};
 pub use orset::{OrSet, Tag, Tagged};
 pub use pncounter::PNCounter;
 
@@ -72,6 +82,73 @@ impl core::fmt::Display for CapacityError {
 }
 
 impl core::error::Error for CapacityError {}
+
+/// Why a state could not be read from or written to a byte buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecError {
+    /// The buffer is shorter than the encoded form needs.
+    Truncated,
+    /// The leading byte names a different structure.
+    Tag,
+    /// The encoded shape does not match the target type's.
+    Parameters,
+}
+
+impl core::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Truncated => "buffer too short",
+            Self::Tag => "wrong structure tag",
+            Self::Parameters => "shape mismatch",
+        })
+    }
+}
+
+impl core::error::Error for CodecError {}
+
+pub(crate) const TAG_LOGICAL_CLOCK: u8 = 0x51;
+pub(crate) const TAG_HYBRID_CLOCK: u8 = 0x52;
+pub(crate) const TAG_GCOUNTER: u8 = 0x61;
+pub(crate) const TAG_PNCOUNTER: u8 = 0x62;
+pub(crate) const TAG_LWW_REGISTER: u8 = 0x71;
+pub(crate) const TAG_GSET: u8 = 0x81;
+pub(crate) const TAG_ORSET: u8 = 0x82;
+
+/// Where a frame's leading structure tag sits.
+pub(crate) const TAG: usize = 0;
+
+/// Bytes a frame spends on its leading structure tag.
+pub(crate) const TAG_LEN: usize = 1;
+
+/// Bytes a frame spends naming the shape it was written at.
+pub(crate) const SHAPE_LEN: usize = 2;
+
+/// Bytes a frame spends saying how many of its slot records carry a slot.
+pub(crate) const COUNT_LEN: usize = 2;
+
+/// Bytes a frame spends on one 64-bit field.
+pub(crate) const FIELD_LEN: usize = 8;
+
+/// A frame's 64-bit field, read from `field`, which is [`FIELD_LEN`] long.
+pub(crate) const fn read_u64(field: &[u8]) -> u64 {
+    let mut bytes = [0_u8; FIELD_LEN];
+    bytes.copy_from_slice(field);
+    u64::from_le_bytes(bytes)
+}
+
+/// The low two bytes of `value`, as a frame's shape or count field.
+pub(crate) const fn small_field(value: usize) -> [u8; SHAPE_LEN] {
+    let [low, high, ..] = value.to_le_bytes();
+    [low, high]
+}
+
+/// A frame's shape or count field, read from `field`, which is [`SHAPE_LEN`]
+/// long.
+pub(crate) fn read_small(field: &[u8]) -> usize {
+    let mut bytes = [0_u8; SHAPE_LEN];
+    bytes.copy_from_slice(field);
+    usize::from(u16::from_le_bytes(bytes))
+}
 
 /// Whether two slot arrays hold the same elements, ignoring where in the array
 /// each one sits.

@@ -1,6 +1,15 @@
 //! A counter that goes both ways, from two that only go up.
 
-use crate::{CapacityError, GCounter, Merge, ReplicaId};
+use crate::{
+    CapacityError, CodecError, GCounter, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_PNCOUNTER,
+    read_small, small_field,
+};
+
+/// Where the shape sits in a frame.
+const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
+
+/// Where the slot table of what went up starts in a frame.
+const INCREMENTS: usize = SHAPE.end;
 
 /// A counter replicas can both raise and lower.
 ///
@@ -63,6 +72,81 @@ impl<const R: usize> PNCounter<R> {
     #[must_use]
     pub fn removed(&self) -> u64 {
         self.decrements.value()
+    }
+
+    /// Where the slot table of what came down starts in a frame.
+    const DECREMENTS: usize = INCREMENTS + GCounter::<R>::BODY_LEN;
+
+    /// Length of the [`encode`](Self::encode) frame.
+    pub const ENCODED_LEN: usize = Self::DECREMENTS + GCounter::<R>::BODY_LEN;
+
+    /// Writes the counter into `out`, returning the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `out` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        self.write_frame(frame);
+        Ok(Self::ENCODED_LEN)
+    }
+
+    /// The counter's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
+        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
+        self.write_frame(&mut frame);
+        frame
+    }
+
+    /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    fn write_frame(&self, frame: &mut [u8]) {
+        frame[TAG] = TAG_PNCOUNTER;
+        frame[SHAPE].copy_from_slice(&small_field(R));
+        self.increments
+            .write_body(&mut frame[INCREMENTS..Self::DECREMENTS]);
+        self.decrements.write_body(&mut frame[Self::DECREMENTS..]);
+    }
+
+    /// Reads a counter written by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
+    /// when it holds another structure, [`CodecError::Parameters`] when it was
+    /// written with another replica count.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut counter = Self::new();
+        counter.decode_into(bytes)?;
+        Ok(counter)
+    }
+
+    /// Reads a frame over a counter the caller already holds.
+    ///
+    /// The counter is untouched when the frame is rejected.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`decode`](Self::decode).
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        if frame[TAG] != TAG_PNCOUNTER {
+            return Err(CodecError::Tag);
+        }
+        if read_small(&frame[SHAPE]) != R {
+            return Err(CodecError::Parameters);
+        }
+
+        self.increments
+            .read_body(&frame[INCREMENTS..Self::DECREMENTS]);
+        self.decrements.read_body(&frame[Self::DECREMENTS..]);
+        Ok(())
     }
 }
 

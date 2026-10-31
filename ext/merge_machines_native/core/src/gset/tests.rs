@@ -1,4 +1,4 @@
-use crate::{CapacityError, GSet, Merge};
+use crate::{CapacityError, CodecError, GSet, Merge};
 
 #[test]
 fn inserting_the_same_element_twice_changes_nothing() {
@@ -64,4 +64,79 @@ fn a_new_element_needs_a_free_slot() {
 
     assert_eq!(set.insert(3), Err(CapacityError));
     assert_eq!(set.insert(1), Ok(()));
+}
+
+/// Length of a four-element set's frame.
+const FRAME_LEN: usize = GSet::<u64, 4>::ENCODED_LEN;
+
+#[test]
+fn a_frame_round_trips_every_element() {
+    let mut set = GSet::<u64, 4>::new();
+    assert_eq!(set.insert(11), Ok(()));
+    assert_eq!(set.insert(22), Ok(()));
+
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(set.encode(&mut frame), Ok(FRAME_LEN));
+
+    let restored = GSet::<u64, 4>::decode(&frame);
+    assert_eq!(restored, Ok(set));
+    assert_eq!(restored.map(|set| set.len()), Ok(2));
+}
+
+#[test]
+fn encoding_into_a_short_buffer_is_refused() {
+    let mut frame = [0_u8; FRAME_LEN - 1];
+
+    assert_eq!(
+        GSet::<u64, 4>::new().encode(&mut frame),
+        Err(CodecError::Truncated)
+    );
+}
+
+#[test]
+fn a_short_frame_is_refused() {
+    assert_eq!(GSet::<u64, 4>::decode(&[]), Err(CodecError::Truncated));
+}
+
+#[test]
+fn another_structures_frame_is_refused() {
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(GSet::<u64, 4>::new().encode(&mut frame), Ok(FRAME_LEN));
+    frame[crate::TAG] = crate::TAG_ORSET;
+
+    assert_eq!(GSet::<u64, 4>::decode(&frame), Err(CodecError::Tag));
+}
+
+#[test]
+fn a_frame_written_at_another_capacity_is_refused() {
+    let mut frame = [0_u8; GSet::<u64, 8>::ENCODED_LEN];
+    assert_eq!(
+        GSet::<u64, 8>::new().encode(&mut frame),
+        Ok(GSet::<u64, 8>::ENCODED_LEN)
+    );
+
+    assert_eq!(GSet::<u64, 4>::decode(&frame), Err(CodecError::Parameters));
+}
+
+#[test]
+fn a_refused_frame_leaves_the_set_alone() {
+    let mut set = GSet::<u64, 4>::new();
+    assert_eq!(set.insert(5), Ok(()));
+    let before = set;
+
+    assert_eq!(set.decode_into(&[]), Err(CodecError::Truncated));
+
+    assert_eq!(set, before);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn the_allocated_frame_is_the_frame() {
+    let mut set = GSet::<u64, 4>::new();
+    assert_eq!(set.insert(7), Ok(()));
+
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(set.encode(&mut frame), Ok(FRAME_LEN));
+
+    assert_eq!(*set.encoded(), frame);
 }

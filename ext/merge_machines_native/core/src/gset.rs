@@ -1,6 +1,18 @@
 //! A set that only grows.
 
-use crate::{CapacityError, Merge, free_slot, same_elements};
+use crate::{
+    COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, SHAPE_LEN, TAG, TAG_GSET, TAG_LEN,
+    free_slot, read_small, read_u64, same_elements, small_field,
+};
+
+/// Where the shape sits in a frame.
+const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
+
+/// Where the number of records carrying an element sits in a frame.
+const HELD: core::ops::Range<usize> = SHAPE.end..SHAPE.end + COUNT_LEN;
+
+/// Where the element records start in a frame.
+const RECORDS: usize = HELD.end;
 
 /// A set nothing is ever taken out of.
 ///
@@ -64,6 +76,88 @@ impl<T: Copy + PartialEq, const N: usize> GSet<T, N> {
     /// The elements, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
         self.slots.iter().flatten().copied()
+    }
+}
+
+impl<const N: usize> GSet<u64, N> {
+    /// Length of the [`encode`](Self::encode) frame.
+    pub const ENCODED_LEN: usize = RECORDS + N * FIELD_LEN;
+
+    /// Writes the set into `out`, returning the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `out` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        self.write_frame(frame);
+        Ok(Self::ENCODED_LEN)
+    }
+
+    /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
+        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
+        self.write_frame(&mut frame);
+        frame
+    }
+
+    /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    fn write_frame(&self, frame: &mut [u8]) {
+        frame.fill(0);
+        frame[TAG] = TAG_GSET;
+        frame[SHAPE].copy_from_slice(&small_field(N));
+        frame[HELD].copy_from_slice(&small_field(self.len()));
+
+        let (records, _) = frame[RECORDS..].as_chunks_mut::<FIELD_LEN>();
+        for (record, element) in records.iter_mut().zip(self.iter()) {
+            *record = element.to_le_bytes();
+        }
+    }
+
+    /// Reads a set written by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
+    /// when it holds another structure, [`CodecError::Parameters`] when it was
+    /// written with another capacity.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut set = Self::new();
+        set.decode_into(bytes)?;
+        Ok(set)
+    }
+
+    /// Reads a frame over a set the caller already holds.
+    ///
+    /// The set is untouched when the frame is rejected.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`decode`](Self::decode).
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        if frame[TAG] != TAG_GSET {
+            return Err(CodecError::Tag);
+        }
+        if read_small(&frame[SHAPE]) != N {
+            return Err(CodecError::Parameters);
+        }
+
+        let held = read_small(&frame[HELD]);
+        let (records, _) = frame[RECORDS..].as_chunks::<FIELD_LEN>();
+
+        self.slots = [None; N];
+        for (slot, record) in self.slots.iter_mut().zip(records.iter().take(held)) {
+            *slot = Some(read_u64(record));
+        }
+        Ok(())
     }
 }
 

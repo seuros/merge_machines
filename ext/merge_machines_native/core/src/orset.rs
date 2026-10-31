@@ -1,6 +1,39 @@
 //! Observed-remove set: a remove only takes out the adds it has seen.
 
-use crate::{CapacityError, Merge, ReplicaId, free_slot, same_elements};
+use crate::{
+    COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN,
+    TAG_ORSET, free_slot, read_small, read_u64, same_elements, small_field,
+};
+
+/// Bytes one tombstone record occupies: the tag's replica then its counter.
+const TOMBSTONE_LEN: usize = 2 * FIELD_LEN;
+
+/// Bytes one add record occupies: the element then the tag it came under.
+const ADD_LEN: usize = FIELD_LEN + TOMBSTONE_LEN;
+
+/// Where the element sits in an add record.
+const ELEMENT: core::ops::Range<usize> = 0..FIELD_LEN;
+
+/// Where the tag sits in an add record.
+const TAGGED: core::ops::Range<usize> = FIELD_LEN..ADD_LEN;
+
+/// Where the tag's replica sits in a tombstone record.
+const REPLICA: core::ops::Range<usize> = 0..FIELD_LEN;
+
+/// Where the tag's counter sits in a tombstone record.
+const COUNTER: core::ops::Range<usize> = FIELD_LEN..TOMBSTONE_LEN;
+
+/// Where the shape sits in a frame.
+const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
+
+/// Where the number of records carrying an add sits in a frame.
+const ADDS_HELD: core::ops::Range<usize> = SHAPE.end..SHAPE.end + COUNT_LEN;
+
+/// Where the number of records carrying a tombstone sits in a frame.
+const REMOVES_HELD: core::ops::Range<usize> = ADDS_HELD.end..ADDS_HELD.end + COUNT_LEN;
+
+/// Where the add records start in a frame.
+const ADDS: usize = REMOVES_HELD.end;
 
 /// Which add a remove is talking about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +187,126 @@ impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
         let free = free_slot(&self.removes).ok_or(CapacityError)?;
         self.removes[free] = Some(tag);
         Ok(())
+    }
+}
+
+impl<const N: usize> OrSet<u64, N> {
+    /// Where the tombstone records start in a frame.
+    const REMOVES: usize = ADDS + N * ADD_LEN;
+
+    /// Length of the [`encode`](Self::encode) frame.
+    pub const ENCODED_LEN: usize = Self::REMOVES + N * TOMBSTONE_LEN;
+
+    /// Writes the set into `out`, returning the number of bytes written.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `out` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        self.write_frame(frame);
+        Ok(Self::ENCODED_LEN)
+    }
+
+    /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
+        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
+        self.write_frame(&mut frame);
+        frame
+    }
+
+    /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
+    fn write_frame(&self, frame: &mut [u8]) {
+        frame.fill(0);
+        frame[TAG] = TAG_ORSET;
+        frame[SHAPE].copy_from_slice(&small_field(N));
+        frame[ADDS_HELD].copy_from_slice(&small_field(self.adds().count()));
+        frame[REMOVES_HELD].copy_from_slice(&small_field(self.removes().count()));
+
+        let (records, _) = frame[ADDS..Self::REMOVES].as_chunks_mut::<ADD_LEN>();
+        for (record, add) in records.iter_mut().zip(self.adds()) {
+            record[ELEMENT].copy_from_slice(&add.element.to_le_bytes());
+            write_tag(add.tag, &mut record[TAGGED]);
+        }
+
+        let (records, _) = frame[Self::REMOVES..].as_chunks_mut::<TOMBSTONE_LEN>();
+        for (record, tag) in records.iter_mut().zip(self.removes()) {
+            write_tag(tag, record);
+        }
+    }
+
+    /// Reads a set written by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
+    /// when it holds another structure, [`CodecError::Parameters`] when it was
+    /// written with another capacity.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut set = Self::new();
+        set.decode_into(bytes)?;
+        Ok(set)
+    }
+
+    /// Reads a frame over a set the caller already holds.
+    ///
+    /// The set is untouched when the frame is rejected.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`decode`](Self::decode).
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
+            return Err(CodecError::Truncated);
+        };
+        if frame[TAG] != TAG_ORSET {
+            return Err(CodecError::Tag);
+        }
+        if read_small(&frame[SHAPE]) != N {
+            return Err(CodecError::Parameters);
+        }
+
+        let adds_held = read_small(&frame[ADDS_HELD]);
+        let removes_held = read_small(&frame[REMOVES_HELD]);
+
+        let (records, _) = frame[ADDS..Self::REMOVES].as_chunks::<ADD_LEN>();
+        self.adds = [const { None }; N];
+        for (slot, record) in self.adds.iter_mut().zip(records.iter().take(adds_held)) {
+            *slot = Some(Tagged {
+                element: read_u64(&record[ELEMENT]),
+                tag: read_tag(&record[TAGGED]),
+            });
+        }
+
+        let (records, _) = frame[Self::REMOVES..].as_chunks::<TOMBSTONE_LEN>();
+        self.removes = [None; N];
+        for (slot, record) in self
+            .removes
+            .iter_mut()
+            .zip(records.iter().take(removes_held))
+        {
+            *slot = Some(read_tag(record));
+        }
+        Ok(())
+    }
+}
+
+/// Writes `tag` into `field`, which is [`TOMBSTONE_LEN`] long.
+fn write_tag(tag: Tag, field: &mut [u8]) {
+    field[REPLICA].copy_from_slice(&tag.replica.to_le_bytes());
+    field[COUNTER].copy_from_slice(&tag.counter.to_le_bytes());
+}
+
+/// Reads a tag from `field`, which is [`TOMBSTONE_LEN`] long.
+fn read_tag(field: &[u8]) -> Tag {
+    Tag {
+        replica: read_u64(&field[REPLICA]),
+        counter: read_u64(&field[COUNTER]),
     }
 }
 

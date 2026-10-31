@@ -146,6 +146,43 @@ assert_eq!(counter.increment(1, 1), Ok(()));
 assert_eq!(counter.increment(2, 1), Err(CapacityError));
 ```
 
+## Putting state on a wire
+
+A state that cannot be sent cannot replicate. Each one encodes to a fixed-length
+frame of its own `ENCODED_LEN` bytes, led by a tag naming the structure and,
+where there is one, a field naming the const generic.
+
+```rust
+use merge_machines::{GCounter, Merge};
+
+let mut local = GCounter::<4>::new();
+assert_eq!(local.increment(1, 5), Ok(()));
+
+let frame = local.encoded();
+assert_eq!(frame.len(), GCounter::<4>::ENCODED_LEN);
+
+// `decode_into` reads a frame over a state the receiver already holds.
+let mut remote = GCounter::<4>::new();
+assert_eq!(remote.decode_into(&frame), Ok(()));
+assert_eq!(remote.value(), 5);
+```
+
+`encode` writes into a caller's buffer and `encoded` allocates one, which needs
+the `alloc` feature. Decoding refuses a frame shorter than `ENCODED_LEN`, one
+written by another structure, and one written at another shape.
+
+```rust
+use merge_machines::{CodecError, GCounter};
+
+let wide = GCounter::<8>::new().encoded();
+
+assert_eq!(GCounter::<4>::decode(&wide), Err(CodecError::Parameters));
+```
+
+Elements, values and stamps on a frame are 64-bit: the sets encode
+`GSet<u64, N>` and `OrSet<u64, N>`, and the register encodes
+`LwwRegister<u64, S>` for a stamp `S` of either `u64` or `HybridTimestamp`.
+
 ## License
 
 MIT.

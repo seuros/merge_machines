@@ -1,0 +1,227 @@
+# Conflict-free replicated data types and the clocks that stamp them. Every
+# class here is defined by the native extension, which binds the
+# `merge-machines` crate.
+#
+# Every state merges commutatively, associatively and idempotently, so replicas
+# converge without a coordinator and without ordering their messages. Nothing
+# here talks to a network: the caller owns the transport and the replica ids.
+module MergeMachines
+  VERSION: String
+
+  # Nanoseconds in a second. Wall-clock readings cross this boundary as seconds
+  # and move through the clocks as nanoseconds.
+  NS_PER_SECOND: Integer
+
+  class Error < StandardError
+  end
+
+  # Raised when a state needs a slot and every one of them is taken.
+  class Full < Error
+  end
+
+  # A wall-clock reading in seconds and the counter that breaks its ties.
+  class Timestamp < ::Data
+    attr_reader wall: Float
+    attr_reader counter: Integer
+  end
+
+  # Which clock stamps a register's writes.
+  type stamp_kind = :logical | :hybrid
+
+  # A counter that only grows, counted separately by each replica.
+  class GCounter
+    # `replicas` is 4, 8, 16 or 32.
+    def self.new: (replicas: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    def replicas: () -> Integer
+
+    # Adds `by` to `replica`'s own count. Raises `Full` when `replica` has no
+    # slot yet and every one of them is taken.
+    def increment: (replica: Integer, ?by: Integer) -> nil
+
+    # What `replica` has added, zero if it has no slot here.
+    def count: (replica: Integer) -> Integer
+
+    # Every replica's count.
+    def value: () -> Integer
+
+    # Folds `other` in. Raises `ArgumentError` on a different replica count.
+    def merge: (GCounter other) -> self
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # A counter replicas can both raise and lower, from two that only grow.
+  class PNCounter
+    # `replicas` is 4, 8, 16 or 32.
+    def self.new: (replicas: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    def replicas: () -> Integer
+
+    def increment: (replica: Integer, ?by: Integer) -> nil
+
+    def decrement: (replica: Integer, ?by: Integer) -> nil
+
+    # Everything added, minus everything taken away, which may be negative.
+    def value: () -> Integer
+
+    def added: () -> Integer
+    def removed: () -> Integer
+
+    # Folds `other` in. Raises `ArgumentError` on a different replica count.
+    def merge: (PNCounter other) -> self
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # One value, held by whichever write was stamped last, with the replica id as
+  # the tie-break.
+  class LwwRegister
+    # `stamp` picks which clock stamps the writes, defaulting to `:logical`.
+    def self.new: (?stamp: stamp_kind) -> instance
+
+    def self.load: (String blob) -> instance
+
+    def stamp_kind: () -> stamp_kind
+
+    # Writes `value` if `stamp` and `replica` beat the write already held.
+    # `stamp` is an Integer on a logical register and a `Timestamp` on a hybrid
+    # one. `value` must be UTF-8.
+    def set: (String value, replica: Integer, stamp: Integer | Timestamp) -> nil
+
+    # The value being held, `nil` until the first write.
+    def value: () -> String?
+
+    # The stamp of the write being held.
+    def stamp: () -> (Integer | Timestamp)
+
+    # The replica that wrote what is being held.
+    def replica: () -> Integer
+
+    # Folds `other` in. Raises `ArgumentError` on a register stamped by the
+    # other clock.
+    def merge: (LwwRegister other) -> self
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # A set nothing is ever taken out of.
+  class GSet
+    # `capacity` is 64, 256 or 1024.
+    def self.new: (capacity: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    def capacity: () -> Integer
+
+    # Adds `key`, which is a no-op if it is already in. Raises `Full` when
+    # `key` is new and every slot is taken, `EncodingError` when it is not
+    # UTF-8.
+    def add: (String key) -> nil
+
+    def include?: (String key) -> bool
+
+    # The keys in the set, in no particular order.
+    def members: () -> Array[String]
+
+    def size: () -> Integer
+    def empty?: () -> bool
+
+    # Unions `other` in. Raises `ArgumentError` on a different capacity.
+    def merge: (GSet other) -> self
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # A set keys can leave, where a concurrent add survives a remove.
+  class OrSet
+    # `capacity` is 64, 256 or 1024, and bounds the adds and the tombstones
+    # separately.
+    def self.new: (capacity: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    def capacity: () -> Integer
+
+    # Adds `key` under a tag of `replica` and the next counter that replica has
+    # not used here. Raises `Full` when every add slot is taken,
+    # `EncodingError` when `key` is not UTF-8.
+    def add: (String key, replica: Integer) -> nil
+
+    # Tombstones every tag this set has seen for `key`. Raises `Full` when the
+    # tombstones do not fit.
+    def remove: (String key) -> nil
+
+    def include?: (String key) -> bool
+
+    # The keys still in the set, each once, in no particular order.
+    def members: () -> Array[String]
+
+    def size: () -> Integer
+    def empty?: () -> bool
+
+    # Folds `other` in. Raises `ArgumentError` on a different capacity.
+    def merge: (OrSet other) -> self
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # Lamport's counter: ordering events without reading a clock.
+  class LogicalClock
+    def self.new: (replica: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    # The replica whose events this clock stamps.
+    def replica: () -> Integer
+
+    # The last stamp this clock issued.
+    def now: () -> Integer
+
+    # Stamps a local event.
+    def tick: () -> Integer
+
+    # Stamps the receipt of `observed`, a stamp from another replica.
+    def observe: (Integer observed) -> Integer
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+
+  # A wall-clock reading paired with a counter that breaks its ties, which never
+  # goes backwards.
+  #
+  # The reading comes from `Process::CLOCK_REALTIME`, which may step backwards.
+  # No deadline may be derived from it.
+  class HybridClock
+    def self.new: (replica: Integer) -> instance
+
+    def self.load: (String blob) -> instance
+
+    # The replica whose events this clock stamps.
+    def replica: () -> Integer
+
+    # The last timestamp this clock issued.
+    def now: () -> Timestamp
+
+    # Stamps a local event at `wall`, in seconds, defaulting to the realtime
+    # clock's reading.
+    def tick: (?wall: Float) -> Timestamp
+
+    # Stamps the receipt of the timestamp `wall` and `counter` name, at the
+    # realtime clock's reading.
+    def observe: (wall: Float, counter: Integer) -> Timestamp
+
+    def dump: () -> String
+    def inspect: () -> String
+  end
+end

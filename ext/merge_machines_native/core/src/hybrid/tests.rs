@@ -1,4 +1,4 @@
-use crate::{HybridClock, HybridTimestamp};
+use crate::{CodecError, HybridClock, HybridTimestamp};
 
 const MS: u64 = 1_000_000;
 
@@ -92,4 +92,74 @@ fn ordering_is_by_reading_then_counter() {
             counter: 10
         } > early
     );
+}
+
+#[test]
+fn a_frame_round_trips_the_last_timestamp_issued() {
+    let mut clock = HybridClock::new();
+    clock.tick(900);
+    clock.tick(900);
+
+    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
+    assert_eq!(clock.encode(&mut frame), Ok(HybridClock::ENCODED_LEN));
+
+    let restored = HybridClock::decode(&frame);
+    assert_eq!(restored, Ok(clock));
+    assert_eq!(
+        restored.map(|clock| clock.last()),
+        Ok(HybridTimestamp {
+            wall_ns: 900,
+            counter: 1,
+        })
+    );
+}
+
+#[test]
+fn encoding_into_a_short_buffer_is_refused() {
+    let mut frame = [0_u8; HybridClock::ENCODED_LEN - 1];
+
+    assert_eq!(
+        HybridClock::new().encode(&mut frame),
+        Err(CodecError::Truncated)
+    );
+}
+
+#[test]
+fn a_short_frame_is_refused() {
+    assert_eq!(HybridClock::decode(&[]), Err(CodecError::Truncated));
+}
+
+#[test]
+fn another_structures_frame_is_refused() {
+    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
+    assert_eq!(
+        HybridClock::new().encode(&mut frame),
+        Ok(HybridClock::ENCODED_LEN)
+    );
+    frame[crate::TAG] = crate::TAG_LOGICAL_CLOCK;
+
+    assert_eq!(HybridClock::decode(&frame), Err(CodecError::Tag));
+}
+
+#[test]
+fn a_refused_frame_leaves_the_clock_alone() {
+    let mut clock = HybridClock::new();
+    clock.tick(5);
+    let before = clock;
+
+    assert_eq!(clock.decode_into(&[]), Err(CodecError::Truncated));
+
+    assert_eq!(clock, before);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn the_allocated_frame_is_the_frame() {
+    let mut clock = HybridClock::new();
+    clock.tick(17);
+
+    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
+    assert_eq!(clock.encode(&mut frame), Ok(HybridClock::ENCODED_LEN));
+
+    assert_eq!(*clock.encoded(), frame);
 }

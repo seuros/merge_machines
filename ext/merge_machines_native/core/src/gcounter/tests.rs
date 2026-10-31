@@ -1,4 +1,4 @@
-use crate::{CapacityError, GCounter, Merge};
+use crate::{CapacityError, CodecError, GCounter, Merge};
 
 #[test]
 fn the_value_is_the_sum_of_every_replicas_count() {
@@ -73,4 +73,79 @@ fn merging_more_replicas_than_there_are_slots_reports_capacity() {
     assert_eq!(right.increment(2, 1), Ok(()));
 
     assert_eq!(left.merge(&right), Err(CapacityError));
+}
+
+/// Length of a four-replica counter's frame.
+const FRAME_LEN: usize = GCounter::<4>::ENCODED_LEN;
+
+#[test]
+fn a_frame_round_trips_every_replicas_count() {
+    let mut counter = GCounter::<4>::new();
+    assert_eq!(counter.increment(7, 2), Ok(()));
+    assert_eq!(counter.increment(9, 5), Ok(()));
+
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(counter.encode(&mut frame), Ok(FRAME_LEN));
+
+    let restored = GCounter::<4>::decode(&frame);
+    assert_eq!(restored, Ok(counter));
+    assert_eq!(restored.map(|counter| counter.value()), Ok(7));
+}
+
+#[test]
+fn encoding_into_a_short_buffer_is_refused() {
+    let mut frame = [0_u8; FRAME_LEN - 1];
+
+    assert_eq!(
+        GCounter::<4>::new().encode(&mut frame),
+        Err(CodecError::Truncated)
+    );
+}
+
+#[test]
+fn a_short_frame_is_refused() {
+    assert_eq!(GCounter::<4>::decode(&[]), Err(CodecError::Truncated));
+}
+
+#[test]
+fn another_structures_frame_is_refused() {
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(GCounter::<4>::new().encode(&mut frame), Ok(FRAME_LEN));
+    frame[crate::TAG] = crate::TAG_GSET;
+
+    assert_eq!(GCounter::<4>::decode(&frame), Err(CodecError::Tag));
+}
+
+#[test]
+fn a_frame_written_at_another_replica_count_is_refused() {
+    let mut frame = [0_u8; GCounter::<8>::ENCODED_LEN];
+    assert_eq!(
+        GCounter::<8>::new().encode(&mut frame),
+        Ok(GCounter::<8>::ENCODED_LEN)
+    );
+
+    assert_eq!(GCounter::<4>::decode(&frame), Err(CodecError::Parameters));
+}
+
+#[test]
+fn a_refused_frame_leaves_the_counter_alone() {
+    let mut counter = GCounter::<4>::new();
+    assert_eq!(counter.increment(1, 5), Ok(()));
+    let before = counter;
+
+    assert_eq!(counter.decode_into(&[]), Err(CodecError::Truncated));
+
+    assert_eq!(counter, before);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn the_allocated_frame_is_the_frame() {
+    let mut counter = GCounter::<4>::new();
+    assert_eq!(counter.increment(3, 9), Ok(()));
+
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(counter.encode(&mut frame), Ok(FRAME_LEN));
+
+    assert_eq!(*counter.encoded(), frame);
 }

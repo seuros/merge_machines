@@ -68,10 +68,9 @@ impl Wrapper {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         let (wall, counter) =
             get_kwargs::<_, (f64, u64), (), ()>(args.keywords, &["wall", "counter"], &[])?.required;
-        let issued = rb_self
-            .clock
-            .borrow_mut()
-            .observe(wall::now_ns(ruby)?, stamped(wall, counter));
+        let now = wall::now_ns(ruby)?;
+        let observed = stamped(wall, counter);
+        let issued = rb_self.clock.borrow_mut().observe(now, observed);
         timestamp(ruby, issued)
     }
 

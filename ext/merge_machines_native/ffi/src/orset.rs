@@ -2,6 +2,7 @@
 //! survives a remove.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use magnus::scan_args::scan_args;
@@ -15,6 +16,9 @@ use crate::{
     CAPACITIES, blob_shape, capacity, codec_error, mismatch, required_kwarg, unsupported,
     unsupported_blob,
 };
+
+/// Tags minted in this process, so no two sets allocate the same one.
+static MINTED: AtomicU64 = AtomicU64::new(0);
 
 /// A set at one of the monomorphised capacities.
 #[derive(Clone)]
@@ -191,7 +195,8 @@ impl Wrapper {
         )
     }
 
-    /// The counter `replica` has not used in this set's tags yet.
+    /// A counter no tag in this process has used, and above anything this
+    /// replica already used in this set.
     fn next_counter(&self, replica: ReplicaId) -> u64 {
         let used = |tag: Tag| (tag.replica == replica).then_some(tag.counter);
         let highest = set!(&*self.set.borrow(), |set| set
@@ -199,8 +204,11 @@ impl Wrapper {
             .map(|add| add.tag)
             .chain(set.removes())
             .filter_map(used)
-            .max());
-        highest.unwrap_or(0).saturating_add(1)
+            .max())
+        .unwrap_or(0);
+
+        let minted = MINTED.fetch_add(1, Ordering::Relaxed);
+        highest.max(minted).saturating_add(1)
     }
 }
 

@@ -1,7 +1,7 @@
 //! `MergeMachines::LwwRegister`: one value, held by whichever write was
 //! stamped last.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use bytes::Bytes;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -58,6 +58,7 @@ macro_rules! register {
 struct Wrapper {
     register: RefCell<Register>,
     names: RefCell<Names>,
+    written: Cell<bool>,
 }
 
 const fn frame_len_of<S: Stamp>(_: &LwwRegister<u64, S>) -> usize {
@@ -100,10 +101,12 @@ impl Wrapper {
         Ok(Self::holding(register, names))
     }
 
-    const fn holding(register: Register, names: Names) -> Self {
+    fn holding(register: Register, names: Names) -> Self {
+        let written = !names.is_empty();
         Self {
             register: RefCell::new(register),
             names: RefCell::new(names),
+            written: Cell::new(written),
         }
     }
 
@@ -128,9 +131,35 @@ impl Wrapper {
                 .required;
 
         let element = hash64(value.as_bytes());
-        match &mut *rb_self.register.borrow_mut() {
-            Register::Logical(register) => register.set(element, u64::try_convert(stamp)?, replica),
-            Register::Hybrid(register) => register.set(element, hybrid(stamp)?, replica),
+        let kind = match &*rb_self.register.borrow() {
+            Register::Logical(_) => Kind::Logical,
+            Register::Hybrid(_) => Kind::Hybrid,
+        };
+        let logical = match kind {
+            Kind::Logical => Some(u64::try_convert(stamp)?),
+            Kind::Hybrid => None,
+        };
+        let hybrid_stamp = match kind {
+            Kind::Hybrid => Some(hybrid(stamp)?),
+            Kind::Logical => None,
+        };
+        let first = !rb_self.written.replace(true);
+        match (&mut *rb_self.register.borrow_mut(), logical, hybrid_stamp) {
+            (Register::Logical(register), Some(stamp), _) => {
+                if first {
+                    **register = LwwRegister::new(element, stamp, replica);
+                } else {
+                    register.set(element, stamp, replica);
+                }
+            }
+            (Register::Hybrid(register), _, Some(stamp)) => {
+                if first {
+                    **register = LwwRegister::new(element, stamp, replica);
+                } else {
+                    register.set(element, stamp, replica);
+                }
+            }
+            _ => unreachable!("the kind was read from the same register"),
         }
         rb_self.names.borrow_mut().insert(element, value);
         rb_self.prune();

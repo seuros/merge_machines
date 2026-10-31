@@ -52,6 +52,32 @@ module MergeMachines
       assert_equal 9, register.stamp
     end
 
+    def test_a_stale_write_loses_to_a_value_that_arrived_by_merge
+      target = LwwRegister.new
+      source = LwwRegister.new
+      source.set('new', replica: 1, stamp: 100)
+      target.merge(source)
+      restored = LwwRegister.load(target.dump)
+
+      [target, restored].each { |register| register.set('stale', replica: 2, stamp: 1) }
+
+      assert_equal ['new', 100, 'new', 100],
+                   [target.value, target.stamp, restored.value, restored.stamp]
+    end
+
+    def test_a_write_stamped_zero_by_replica_zero_is_still_a_write
+      register = LwwRegister.new
+      register.set('zero', replica: 0, stamp: 0)
+
+      assert_equal ['zero', 0, 0], [register.value, register.stamp, register.replica]
+
+      target = LwwRegister.new
+      target.merge(register)
+
+      assert_equal 'zero', target.value
+      assert_equal 'zero', LwwRegister.load(target.dump).value
+    end
+
     def test_a_blob_round_trips_the_value_as_a_string
       register = LwwRegister.new
       register.set('héllo', replica: 3, stamp: 7)

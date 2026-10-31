@@ -1,7 +1,7 @@
 //! `MergeMachines::LwwRegister`: one value, held by whichever write was
 //! stamped last.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use bytes::Bytes;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -36,6 +36,9 @@ impl Kind {
     }
 }
 
+/// The two registers are stamped by different clocks.
+struct ClockMismatch;
+
 /// A register stamped by one of the two clocks.
 #[derive(Clone)]
 enum Register {
@@ -53,12 +56,88 @@ macro_rules! register {
     };
 }
 
+impl Register {
+    const fn kind(&self) -> Kind {
+        match self {
+            Self::Logical(_) => Kind::Logical,
+            Self::Hybrid(_) => Kind::Hybrid,
+        }
+    }
+
+    /// The hash of the value being held.
+    fn value(&self) -> u64 {
+        register!(self, |inner| *inner.value())
+    }
+
+    /// Keeps whichever of the two writes was stamped last.
+    fn merge(&mut self, other: &Self) -> Result<(), ClockMismatch> {
+        match (self, other) {
+            (Self::Logical(held), Self::Logical(source)) => {
+                let Ok(()) = held.merge(source);
+                Ok(())
+            }
+            (Self::Hybrid(held), Self::Hybrid(source)) => {
+                let Ok(()) = held.merge(source);
+                Ok(())
+            }
+            _ => Err(ClockMismatch),
+        }
+    }
+}
+
+/// A register, and whether a write has landed in it.
+///
+/// A write is kept only when it beats the one being held, so a register that
+/// has had none has to say so rather than hold a zeroed write: stamp 0 from
+/// replica 0 is a write like any other, and nothing beats it.
+#[derive(Clone)]
+enum Slot {
+    Empty(Register),
+    Held(Register),
+}
+
+impl Slot {
+    const fn register(&self) -> &Register {
+        match self {
+            Self::Empty(register) | Self::Held(register) => register,
+        }
+    }
+
+    const fn kind(&self) -> Kind {
+        self.register().kind()
+    }
+
+    /// The hash of the value being held, `None` until the first write.
+    fn held(&self) -> Option<u64> {
+        match self {
+            Self::Empty(_) => None,
+            Self::Held(register) => Some(register.value()),
+        }
+    }
+
+    /// Folds `other` in: taken outright when no write has landed here yet,
+    /// otherwise kept only when it beats the write being held.
+    fn merge(&mut self, other: &Self) -> Result<(), ClockMismatch> {
+        if self.kind() != other.kind() {
+            return Err(ClockMismatch);
+        }
+        let Self::Held(source) = other else {
+            return Ok(());
+        };
+        if let Self::Held(held) = self {
+            held.merge(source)
+        } else {
+            *self = Self::Held(source.clone());
+            Ok(())
+        }
+    }
+}
+
 /// The register, and the string its value was hashed from.
 #[magnus::wrap(class = "MergeMachines::LwwRegister", free_immediately, size)]
 struct Wrapper {
-    register: RefCell<Register>,
+    slot: RefCell<Slot>,
     names: RefCell<Names>,
-    written: Cell<bool>,
 }
 
 const fn frame_len_of<S: Stamp>(_: &LwwRegister<u64, S>) -> usize {
@@ -78,6 +157,11 @@ fn boxed_new<S: Stamp>() -> Box<LwwRegister<u64, S>> {
 }
 
 #[inline(never)]
+fn boxed_write<S: Stamp>(element: u64, stamp: S, replica: ReplicaId) -> Box<LwwRegister<u64, S>> {
+    Box::new(LwwRegister::new(element, stamp, replica))
+}
+
+#[inline(never)]
 fn boxed_decode<S: Stamp>(ruby: &Ruby, frame: &[u8]) -> Result<Box<LwwRegister<u64, S>>, Error> {
     let mut register = boxed_new::<S>();
     register
@@ -90,10 +174,16 @@ impl Wrapper {
     fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         let kind = requested_kind(ruby, optional_kwarg(args.keywords, "stamp")?)?;
-        Ok(Self::holding(dispatch(ruby, kind, None)?, Names::new()))
+        Ok(Self {
+            slot: RefCell::new(Slot::Empty(dispatch(ruby, kind, None)?)),
+            names: RefCell::new(Names::new()),
+        })
     }
 
     /// Reads a blob written by [`dump`](Self::dump).
+    ///
+    /// A blob names the value it holds, so one with no name record and a zeroed
+    /// frame came from a register nobody wrote.
     fn load(ruby: &Ruby, blob: Bytes) -> Result<Self, Error> {
         let kind = match blob.get(crate::SHAPE).map(|field| field[0]) {
             Some(STAMP_LOGICAL) => Kind::Logical,
@@ -103,28 +193,22 @@ impl Wrapper {
         let register = dispatch(ruby, kind, Some(&blob))?;
         let frame_len = register!(&register, |inner| frame_len_of(&**inner));
         let names = names::read(ruby, &blob[frame_len..])?;
-        if register!(&register, |inner| holds_write(&**inner)) {
-            let held = register!(&register, |inner| *inner.value());
-            names::complete(ruby, &names, core::iter::once(held))?;
-        }
+        let written = !names.is_empty() || register!(&register, |inner| holds_write(&**inner));
+        let slot = if written {
+            names::complete(ruby, &names, core::iter::once(register.value()))?;
+            Slot::Held(register)
+        } else {
+            Slot::Empty(register)
+        };
 
-        Ok(Self::holding(register, names))
-    }
-
-    fn holding(register: Register, names: Names) -> Self {
-        let written = !names.is_empty();
-        Self {
-            register: RefCell::new(register),
+        Ok(Self {
+            slot: RefCell::new(slot),
             names: RefCell::new(names),
-            written: Cell::new(written),
-        }
+        })
     }
 
     fn kind(&self) -> Kind {
-        match &*self.register.borrow() {
-            Register::Logical(_) => Kind::Logical,
-            Register::Hybrid(_) => Kind::Hybrid,
-        }
+        self.slot.borrow().kind()
     }
 
     /// Which clock stamps this register's writes.
@@ -133,7 +217,7 @@ impl Wrapper {
     }
 
     /// Writes `value` if `stamp:` and `replica:` beat the write already held.
-    fn set(rb_self: &Self, args: &[Value]) -> Result<(), Error> {
+    fn set(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (value,) = args.required;
         let (replica, stamp) =
@@ -141,36 +225,14 @@ impl Wrapper {
                 .required;
 
         let element = hash64(value.as_bytes());
-        let kind = match &*rb_self.register.borrow() {
-            Register::Logical(_) => Kind::Logical,
-            Register::Hybrid(_) => Kind::Hybrid,
-        };
-        let logical = match kind {
-            Kind::Logical => Some(u64::try_convert(stamp)?),
-            Kind::Hybrid => None,
-        };
-        let hybrid_stamp = match kind {
-            Kind::Hybrid => Some(hybrid(stamp)?),
-            Kind::Logical => None,
-        };
-        let first = !rb_self.written.replace(true);
-        match (&mut *rb_self.register.borrow_mut(), logical, hybrid_stamp) {
-            (Register::Logical(register), Some(stamp), _) => {
-                if first {
-                    **register = LwwRegister::new(element, stamp, replica);
-                } else {
-                    register.set(element, stamp, replica);
-                }
+        let kind = rb_self.kind();
+        let write = match kind {
+            Kind::Logical => {
+                Register::Logical(boxed_write(element, u64::try_convert(stamp)?, replica))
             }
-            (Register::Hybrid(register), _, Some(stamp)) => {
-                if first {
-                    **register = LwwRegister::new(element, stamp, replica);
-                } else {
-                    register.set(element, stamp, replica);
-                }
-            }
-            _ => unreachable!("the kind was read from the same register"),
-        }
+            Kind::Hybrid => Register::Hybrid(boxed_write(element, hybrid(stamp)?, replica)),
+        };
+        folded(ruby, &mut rb_self.slot.borrow_mut(), &Slot::Held(write))?;
         rb_self.names.borrow_mut().insert(element, value);
         rb_self.prune();
         Ok(())
@@ -178,13 +240,13 @@ impl Wrapper {
 
     /// The value being held, `nil` until the first write.
     fn value(&self) -> Option<String> {
-        let held = self.held();
+        let held = self.slot.borrow().held()?;
         self.names.borrow().get(&held).cloned()
     }
 
     /// The stamp of the write being held.
     fn stamp(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
-        match &*rb_self.register.borrow() {
+        match rb_self.slot.borrow().register() {
             Register::Logical(register) => Ok(ruby.into_value(*register.stamp())),
             Register::Hybrid(register) => timestamp(ruby, *register.stamp()),
         }
@@ -192,21 +254,13 @@ impl Wrapper {
 
     /// The replica that wrote what is being held.
     fn replica(&self) -> ReplicaId {
-        register!(&*self.register.borrow(), |register| register.replica())
+        register!(self.slot.borrow().register(), |register| register.replica())
     }
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: &Self) -> Result<Obj<Self>, Error> {
-        let source = other.register.borrow().clone();
+        let source = other.slot.borrow().clone();
         let names = other.names.borrow().clone();
-        match (&mut *rb_self.register.borrow_mut(), &source) {
-            (Register::Logical(target), Register::Logical(source)) => {
-                let Ok(()) = target.merge(source);
-            }
-            (Register::Hybrid(target), Register::Hybrid(source)) => {
-                let Ok(()) = target.merge(source);
-            }
-            _ => return Err(mismatch(ruby, "register")),
-        }
+        folded(ruby, &mut rb_self.slot.borrow_mut(), &source)?;
         rb_self.names.borrow_mut().extend(names);
         rb_self.prune();
         Ok(rb_self)
@@ -222,13 +276,10 @@ impl Wrapper {
     /// The frame holds the value's 64-bit hash, so [`load`](Self::load)
     /// rehashes the name to give [`value`](Self::value) its string back.
     fn dump(ruby: &Ruby, rb_self: &Self) -> RString {
-        let frame = register!(&*rb_self.register.borrow(), |register| register.encoded());
+        let slot = rb_self.slot.borrow();
+        let frame = register!(slot.register(), |register| register.encoded());
         let mut blob = Vec::from(frame);
-        names::write(
-            &mut blob,
-            &rb_self.names.borrow(),
-            core::iter::once(rb_self.held()),
-        );
+        names::write(&mut blob, &rb_self.names.borrow(), slot.held().into_iter());
         ruby.str_from_slice(&blob)
     }
 
@@ -242,18 +293,19 @@ impl Wrapper {
         )
     }
 
-    /// The hash of the value being held.
-    fn held(&self) -> u64 {
-        register!(&*self.register.borrow(), |register| *register.value())
-    }
-
     /// Drops the names of writes that lost.
     fn prune(&self) {
-        let held = self.held();
+        let held = self.slot.borrow().held();
         self.names
             .borrow_mut()
-            .retain(|element, _| *element == held);
+            .retain(|element, _| Some(*element) == held);
     }
+}
+
+/// Folds `other` into `slot`, rejecting a register the other clock stamps.
+fn folded(ruby: &Ruby, slot: &mut Slot, other: &Slot) -> Result<(), Error> {
+    slot.merge(other)
+        .map_err(|ClockMismatch| mismatch(ruby, "register"))
 }
 
 /// The timestamp a `Timestamp` names.

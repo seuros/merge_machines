@@ -32,6 +32,18 @@ module MergeMachines
       assert_equal 43, restored.tick
     end
 
+    def test_a_counter_with_nothing_left_refuses_to_reissue_its_last_stamp
+      clock = LogicalClock.new(replica: 1)
+      last = (2**64) - 1
+
+      assert_equal last, clock.observe(last - 1)
+      assert_raises(Exhausted) { clock.tick }
+      assert_raises(Exhausted) { clock.observe(2) }
+      assert_equal last, clock.now
+
+      assert_raises(Exhausted) { LogicalClock.new(replica: 1).observe(last) }
+    end
+
     def test_load_rejects_a_blob_it_did_not_write
       assert_raises(ArgumentError) { LogicalClock.load('') }
       assert_raises(ArgumentError) { LogicalClock.load(HybridClock.new(replica: 1).dump) }

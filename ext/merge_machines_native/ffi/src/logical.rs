@@ -7,7 +7,7 @@ use magnus::scan_args::scan_args;
 use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
 use merge_machines::{LogicalClock, ReplicaId};
 
-use crate::{codec_error, required_kwarg, trailing_replica};
+use crate::{codec_error, exhausted, required_kwarg, trailing_replica};
 
 /// A clock and the replica whose events it stamps, which the core does not
 /// hold.
@@ -49,13 +49,13 @@ impl Wrapper {
     }
 
     /// Stamps a local event.
-    fn tick(&self) -> u64 {
-        self.clock.borrow_mut().tick()
+    fn tick(ruby: &Ruby, rb_self: &Self) -> Result<u64, Error> {
+        exhausted(ruby, rb_self.clock.borrow_mut().tick())
     }
 
     /// Stamps the receipt of `observed`, a stamp from another replica.
-    fn observe(&self, observed: u64) -> u64 {
-        self.clock.borrow_mut().observe(observed)
+    fn observe(ruby: &Ruby, rb_self: &Self, observed: u64) -> Result<u64, Error> {
+        exhausted(ruby, rb_self.clock.borrow_mut().observe(observed))
     }
 
     /// The core frame followed by the replica id, 64-bit little-endian.

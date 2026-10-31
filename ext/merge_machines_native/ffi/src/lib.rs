@@ -27,10 +27,13 @@ use std::sync::OnceLock;
 use magnus::scan_args::get_kwargs;
 use magnus::value::Opaque;
 use magnus::{Error, ExceptionClass, RHash, RModule, Ruby, TryConvert, prelude::*};
-use merge_machines::{CapacityError, CodecError, ReplicaId};
+use merge_machines::{CapacityError, ClockExhausted, CodecError, ReplicaId};
 
 /// `MergeMachines::Full`, defined in [`init`].
 static FULL: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
+
+/// `MergeMachines::Exhausted`, defined in [`init`].
+static EXHAUSTED: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
 
 /// Nanoseconds in a second.
 pub(crate) const NS_PER_SECOND: u32 = 1_000_000_000;
@@ -149,19 +152,30 @@ pub(crate) fn defined_twice(ruby: &Ruby, name: &str) -> Error {
 
 /// Raises `MergeMachines::Full` for a state that ran out of slots.
 pub(crate) fn capacity(ruby: &Ruby, outcome: Result<(), CapacityError>) -> Result<(), Error> {
-    outcome.map_err(|error| {
-        FULL.get().map_or_else(
-            || uninitialised(ruby),
-            |class| Error::new(ruby.get_inner(*class), error.to_string()),
-        )
-    })
+    outcome.map_err(|error| raised(ruby, &FULL, error.to_string()))
+}
+
+/// Raises `MergeMachines::Exhausted` for a clock that ran out of timestamps.
+pub(crate) fn exhausted<T>(ruby: &Ruby, outcome: Result<T, ClockExhausted>) -> Result<T, Error> {
+    outcome.map_err(|error| raised(ruby, &EXHAUSTED, error.to_string()))
+}
+
+fn raised(ruby: &Ruby, class: &OnceLock<Opaque<ExceptionClass>>, message: String) -> Error {
+    class.get().map_or_else(
+        || uninitialised(ruby),
+        |class| Error::new(ruby.get_inner(*class), message),
+    )
 }
 
 fn define_errors(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let base = module.define_error("Error", ruby.exception_standard_error())?;
     let full = module.define_error("Full", base)?;
     FULL.set(full.into())
-        .map_err(|_| defined_twice(ruby, "Full"))
+        .map_err(|_| defined_twice(ruby, "Full"))?;
+    let exhausted = module.define_error("Exhausted", base)?;
+    EXHAUSTED
+        .set(exhausted.into())
+        .map_err(|_| defined_twice(ruby, "Exhausted"))
 }
 
 #[magnus::init]

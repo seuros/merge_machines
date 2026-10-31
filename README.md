@@ -144,6 +144,9 @@ clock.observe(42)          # => 43, past both the local history and the send
 clock.now                  # => 43
 ```
 
+A counter with nothing left raises `MergeMachines::Exhausted` rather than
+handing out a stamp it already gave away, and the clock stays where it was.
+
 `HybridClock` pairs a wall-clock reading with a counter: close to physical
 time, still totally ordered, and still monotonic when the host's clock is
 corrected backwards.

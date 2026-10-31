@@ -20,7 +20,9 @@
 //! does not have and does not want.
 //!
 //! State is fixed-size: capacities are const generics, and a state with no free
-//! slot left reports [`CapacityError`] rather than allocating.
+//! slot left reports [`CapacityError`] rather than allocating. A clock whose
+//! counter has run out reports [`ClockExhausted`] rather than reissuing the
+//! timestamp it last gave away.
 //!
 //! # Putting state on a wire
 //!
@@ -74,6 +76,18 @@ pub trait Merge {
 /// The union needed a slot and there was none left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityError;
+
+/// A clock has issued the last timestamp its counter can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockExhausted;
+
+impl core::fmt::Display for ClockExhausted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("no timestamp left")
+    }
+}
+
+impl core::error::Error for ClockExhausted {}
 
 impl core::fmt::Display for CapacityError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

@@ -51,18 +51,23 @@ assert_eq!(left.value(), 6);
 ## Ordering events with no clock at all
 
 Lamport's counter advances on every local event and jumps past any timestamp it
-is shown, so a receive is always stamped after the send it answers.
+is shown, so a receive is always stamped after the send it answers. A counter
+with nothing left reports `ClockExhausted` instead of handing out a timestamp it
+already gave away.
 
 ```rust
-use merge_machines::LogicalClock;
+use merge_machines::{ClockExhausted, LogicalClock};
 
 let mut sender = LogicalClock::new();
 let mut receiver = LogicalClock::new();
 
-let sent_at = sender.tick();
-receiver.tick();
+let sent_at = sender.tick()?;
+receiver.tick()?;
 
-assert!(receiver.observe(sent_at) > sent_at);
+assert!(receiver.observe(sent_at)? > sent_at);
+assert_eq!(receiver.observe(u64::MAX), Err(ClockExhausted));
+
+Ok::<(), ClockExhausted>(())
 ```
 
 ## Timestamps that also mean something to a human

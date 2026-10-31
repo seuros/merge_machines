@@ -138,8 +138,8 @@ impl Wrapper {
             (Set::N1024(target), Set::N1024(source)) => target.merge(source),
             _ => return Err(mismatch(ruby, "set")),
         };
-        capacity(ruby, folded)?;
         rb_self.names.borrow_mut().extend(names);
+        capacity(ruby, folded)?;
         Ok(rb_self)
     }
 

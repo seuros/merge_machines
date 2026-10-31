@@ -96,6 +96,21 @@ module MergeMachines
       assert_equal 64, set.size
     end
 
+    def test_a_merge_that_overran_capacity_names_what_it_took_and_forgets_the_rest
+      target = OrSet.new(capacity: 64)
+      62.times { |index| target.add("base#{index}", replica: 1) }
+      source = OrSet.new(capacity: 64)
+      10.times { |index| source.add("extra#{index}", replica: 2) }
+
+      assert_raises(Full) { target.merge(source) }
+      assert_equal 64, target.members.size
+      assert_equal 64, OrSet.load(target.dump).members.size
+
+      assert_drops_rejected_keys(target) do |key|
+        OrSet.new(capacity: 64).tap { |rejected| rejected.add(key, replica: 3) }
+      end
+    end
+
     def test_a_key_that_is_not_utf_8_is_rejected
       assert_raises(EncodingError) { OrSet.new(capacity: 64).add("\xff\xfe".b, replica: 1) }
     end

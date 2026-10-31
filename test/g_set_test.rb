@@ -78,6 +78,21 @@ module MergeMachines
       assert_equal 64, set.size
     end
 
+    def test_a_merge_that_overran_capacity_names_what_it_took_and_forgets_the_rest
+      target = GSet.new(capacity: 64)
+      62.times { |index| target.add("base#{index}") }
+      source = GSet.new(capacity: 64)
+      10.times { |index| source.add("extra#{index}") }
+
+      assert_raises(Full) { target.merge(source) }
+      assert_equal 64, target.members.size
+      assert_equal 64, GSet.load(target.dump).members.size
+
+      assert_drops_rejected_keys(target) do |key|
+        GSet.new(capacity: 64).tap { |rejected| rejected.add(key) }
+      end
+    end
+
     def test_a_key_that_is_not_utf_8_is_rejected
       assert_raises(EncodingError) { GSet.new(capacity: 64).add("\xff\xfe".b) }
     end

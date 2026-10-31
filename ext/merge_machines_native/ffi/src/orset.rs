@@ -90,10 +90,12 @@ impl Wrapper {
             .collect::<Vec<u64>>());
         names::complete(ruby, &names, elements.into_iter())?;
 
-        Ok(Self {
+        let wrapper = Self {
             set: RefCell::new(set),
             names: RefCell::new(names),
-        })
+        };
+        wrapper.prune();
+        Ok(wrapper)
     }
 
     fn capacity(&self) -> usize {
@@ -162,6 +164,7 @@ impl Wrapper {
             _ => return Err(mismatch(ruby, "set")),
         };
         rb_self.names.borrow_mut().extend(names);
+        rb_self.prune();
         capacity(ruby, folded)?;
         Ok(rb_self)
     }
@@ -193,6 +196,20 @@ impl Wrapper {
             self.capacity(),
             self.size()
         )
+    }
+
+    /// Leaves a name for every add the core holds, tombstoned or not, and for
+    /// nothing else.
+    ///
+    /// A merge extends the table before the core reports whether everything
+    /// fit, because a merge that overran capacity still took whatever it had
+    /// room for and those keys need their names. Reconciling afterwards keeps
+    /// the names of the adds that landed and drops the ones that did not.
+    fn prune(&self) {
+        let set = self.set.borrow();
+        self.names.borrow_mut().retain(|element, _| {
+            set!(&*set, |held| held.adds().any(|add| add.element == *element))
+        });
     }
 
     /// A counter no tag in this process has used, and above anything this

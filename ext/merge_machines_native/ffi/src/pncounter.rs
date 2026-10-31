@@ -83,12 +83,12 @@ impl Wrapper {
     }
 
     /// Everything added, by every replica.
-    fn added(&self) -> u64 {
+    fn added(&self) -> u128 {
         counter!(&*self.0.borrow(), |counter| counter.added())
     }
 
     /// Everything taken away, by every replica.
-    fn removed(&self) -> u64 {
+    fn removed(&self) -> u128 {
         counter!(&*self.0.borrow(), |counter| counter.removed())
     }
 

@@ -69,6 +69,26 @@ fn a_frame_round_trips_what_went_up_and_what_came_down() {
 }
 
 #[test]
+fn a_balance_is_not_clamped_by_the_total_of_either_side() {
+    let mut counter = PNCounter::<4>::new();
+    assert_eq!(counter.increment(1, u64::MAX), Ok(()));
+    assert_eq!(counter.increment(2, u64::MAX), Ok(()));
+    assert_eq!(counter.decrement(3, u64::MAX), Ok(()));
+
+    assert_eq!(counter.added(), u128::from(u64::MAX) + u128::from(u64::MAX));
+    assert_eq!(counter.removed(), u128::from(u64::MAX));
+    assert_eq!(counter.value(), i128::from(u64::MAX));
+
+    let mut frame = [0_u8; FRAME_LEN];
+    assert_eq!(counter.encode(&mut frame), Ok(FRAME_LEN));
+
+    assert_eq!(
+        PNCounter::<4>::decode(&frame).map(|restored| restored.value()),
+        Ok(i128::from(u64::MAX))
+    );
+}
+
+#[test]
 fn encoding_into_a_short_buffer_is_refused() {
     let mut frame = [0_u8; FRAME_LEN - 1];
 

@@ -88,13 +88,10 @@ impl<const R: usize> GCounter<R> {
             .map_or(0, |entry| entry.count)
     }
 
-    /// Every replica's count, saturating at [`u64::MAX`].
+    /// Every replica's count, totalled wide enough never to clamp.
     #[must_use]
-    pub fn value(&self) -> u64 {
-        self.slots
-            .iter()
-            .flatten()
-            .fold(0, |total, entry| total.saturating_add(entry.count))
+    pub fn value(&self) -> u128 {
+        self.entries().map(|entry| u128::from(entry.count)).sum()
     }
 
     /// The per-replica counts, in no particular order.

@@ -37,6 +37,17 @@ module MergeMachines
       assert_equal [0, 5], [counter.added, counter.removed]
     end
 
+    def test_a_balance_wider_than_one_slot_crosses_intact
+      slot_max = (2**64) - 1
+      counter = PNCounter.new(replicas: 4)
+      counter.increment(replica: 1, by: slot_max)
+      counter.increment(replica: 2, by: slot_max)
+      counter.decrement(replica: 3, by: slot_max)
+
+      assert_equal [slot_max, slot_max], [counter.value, PNCounter.load(counter.dump).value]
+      assert_equal [slot_max * 2, slot_max], [counter.added, counter.removed]
+    end
+
     def test_a_blob_round_trips_both_directions
       counter = PNCounter.new(replicas: 4)
       counter.increment(replica: 1, by: 10)

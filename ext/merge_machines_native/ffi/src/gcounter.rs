@@ -73,7 +73,7 @@ impl Wrapper {
     }
 
     /// Every replica's count.
-    fn value(&self) -> u64 {
+    fn value(&self) -> u128 {
         counter!(&*self.0.borrow(), |counter| counter.value())
     }
 

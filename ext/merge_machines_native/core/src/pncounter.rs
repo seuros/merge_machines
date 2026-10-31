@@ -61,18 +61,18 @@ impl<const R: usize> PNCounter<R> {
     /// Everything added, minus everything taken away.
     #[must_use]
     pub fn value(&self) -> i128 {
-        i128::from(self.increments.value()) - i128::from(self.decrements.value())
+        total(&self.increments) - total(&self.decrements)
     }
 
     /// Everything added, by every replica.
     #[must_use]
-    pub fn added(&self) -> u64 {
+    pub fn added(&self) -> u128 {
         self.increments.value()
     }
 
     /// Everything taken away, by every replica.
     #[must_use]
-    pub fn removed(&self) -> u64 {
+    pub fn removed(&self) -> u128 {
         self.decrements.value()
     }
 
@@ -139,6 +139,11 @@ impl<const R: usize> PNCounter<R> {
         self.decrements.read_body(&frame[Self::DECREMENTS..]);
         Ok(())
     }
+}
+
+/// One side's count, signed so the other side can be taken from it.
+fn total<const R: usize>(side: &GCounter<R>) -> i128 {
+    side.entries().map(|entry| i128::from(entry.count)).sum()
 }
 
 impl<const R: usize> Merge for PNCounter<R> {

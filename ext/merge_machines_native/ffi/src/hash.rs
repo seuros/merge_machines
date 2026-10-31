@@ -14,7 +14,7 @@ const fn mix64(value: u64) -> u64 {
 }
 
 /// Hashes bytes, folding [`FIELD_LEN`] at a time through [`mix64`], then the
-/// remainder and the length together.
+/// remainder and the length separately.
 pub fn hash64(bytes: &[u8]) -> u64 {
     let (lanes, tail) = bytes.as_chunks::<FIELD_LEN>();
     let mut accumulator = PRIME;
@@ -29,5 +29,5 @@ pub fn hash64(bytes: &[u8]) -> u64 {
     last[..tail.len()].copy_from_slice(tail);
     let length = u64::from_le_bytes(field(bytes.len()));
 
-    mix64(accumulator ^ mix64(u64::from_le_bytes(last) ^ length))
+    mix64(mix64(accumulator ^ length.wrapping_mul(PRIME)) ^ mix64(u64::from_le_bytes(last)))
 }

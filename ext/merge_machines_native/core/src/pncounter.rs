@@ -4,13 +4,6 @@ use crate::{CapacityError, GCounter, Merge, ReplicaId};
 
 /// A counter replicas can both raise and lower.
 ///
-/// Subtraction cannot be merged by taking a maximum, so this keeps two
-/// grow-only counters, one for what was added and one for what was taken away,
-/// and reports the difference. Both halves only ever grow, so both merge the
-/// same way a [`GCounter`] does.
-///
-/// `R` is how many distinct replicas each half holds.
-///
 /// ```
 /// use merge_machines::{Merge, PNCounter};
 ///

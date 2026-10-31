@@ -2,16 +2,6 @@
 
 /// A counter that orders events across replicas, with no clock involved.
 ///
-/// From Lamport (1978), "Time, Clocks, and the Ordering of Events in a
-/// Distributed System". A local event advances the counter by one. An observed
-/// timestamp from another replica pushes the counter past it, so a message is
-/// always stamped later than the send it answers.
-///
-/// If event `a` happened before event `b` then `a`'s timestamp is lower. The
-/// converse does not hold: a lower timestamp does not prove happens-before,
-/// because two replicas that never talked can issue the same number. That is
-/// what vector clocks buy and this does not.
-///
 /// ```
 /// use merge_machines::LogicalClock;
 ///

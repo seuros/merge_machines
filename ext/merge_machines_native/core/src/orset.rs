@@ -3,11 +3,6 @@
 use crate::{CapacityError, Merge, ReplicaId, free_slot, same_elements};
 
 /// Which add a remove is talking about.
-///
-/// Unique across the cluster: the replica that made the add, and a counter from
-/// that replica's [`LogicalClock`](crate::LogicalClock). Two replicas adding
-/// the same element concurrently produce two different tags, so a remove that
-/// only saw one of them leaves the other standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tag {
     /// The replica that made the add.
@@ -33,16 +28,6 @@ pub struct Tagged<T> {
 }
 
 /// A set elements can leave, where concurrent adds survive a remove.
-///
-/// Every add carries a [`Tag`]. Removing an element tombstones the tags this
-/// replica has seen for it, and an element is in the set while it has at least
-/// one tag that is not tombstoned. So a remove races a concurrent add on
-/// another replica and loses, which is the behaviour people expect from a set
-/// of live members, and re-adding after a remove works because the new tag was
-/// never tombstoned.
-///
-/// `N` bounds both the adds and the tombstones. Removing never frees an add
-/// slot: that is what lets a tombstone merge in after the add it answers.
 ///
 /// ```
 /// use merge_machines::{Merge, OrSet, Tag};

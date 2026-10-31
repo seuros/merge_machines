@@ -5,16 +5,6 @@ use core::convert::Infallible;
 
 /// One value, held by whichever write was stamped last.
 ///
-/// `S` is the stamp type: `u64` from a [`LogicalClock`](crate::LogicalClock),
-/// or a [`HybridTimestamp`](crate::HybridTimestamp) from a
-/// [`HybridClock`](crate::HybridClock). Writes order by stamp, and equal stamps
-/// order by the writing replica's id, so two replicas resolving the same
-/// concurrent write pick the same winner instead of each keeping its own.
-///
-/// The losing write is gone. That is what last-writer-wins costs, and why it
-/// suits a value where only the newest reading matters and not a value where
-/// every update has to survive.
-///
 /// ```
 /// use merge_machines::{LwwRegister, Merge};
 ///

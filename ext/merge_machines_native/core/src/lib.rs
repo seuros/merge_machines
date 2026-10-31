@@ -44,16 +44,9 @@ pub use orset::{OrSet, Tag, Tagged};
 pub use pncounter::PNCounter;
 
 /// Which replica an update came from.
-///
-/// Uniqueness is the caller's problem: two live replicas sharing an id will
-/// overwrite each other's counts and tie-break against themselves.
 pub type ReplicaId = u64;
 
 /// A state that can absorb another replica's state.
-///
-/// The merge is commutative, associative and idempotent. Those three laws are
-/// what let replicas gossip in any order, re-deliver whatever they like, and
-/// still converge without a coordinator.
 pub trait Merge {
     /// Why this state could not absorb the other one.
     type Error;
@@ -82,9 +75,6 @@ impl core::error::Error for CapacityError {}
 
 /// Whether two slot arrays hold the same elements, ignoring where in the array
 /// each one sits.
-///
-/// Insertion order differs between replicas, so slot-by-slot equality would
-/// call two identical states different.
 pub(crate) fn same_elements<T: PartialEq>(left: &[Option<T>], right: &[Option<T>]) -> bool {
     let contained =
         |haystack: &[Option<T>], needle: &T| haystack.iter().flatten().any(|held| held == needle);

@@ -4,13 +4,6 @@ use crate::{CapacityError, Merge, free_slot, same_elements};
 
 /// A set nothing is ever taken out of.
 ///
-/// Adding is the only update, so merging is the union and there is nothing to
-/// resolve. Use [`OrSet`](crate::OrSet) when elements have to leave.
-///
-/// `N` is how many distinct elements this state holds. Lookups scan the slots,
-/// which is the trade for needing no heap, no hashing and no ordering of
-/// elements.
-///
 /// ```
 /// use merge_machines::{GSet, Merge};
 ///

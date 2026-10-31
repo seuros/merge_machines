@@ -13,14 +13,6 @@ pub struct Entry {
 
 /// A counter that only grows, counted separately by each replica.
 ///
-/// A single shared number cannot be merged: two replicas that both saw 5 and
-/// both added 1 have no way to tell 6 from 7. Keeping one count per replica
-/// does, because no replica ever touches another's count, so merging is the
-/// larger count for each replica and the value is the sum.
-///
-/// `R` is how many distinct replicas this state holds. Lookups scan the slots,
-/// which is the trade for needing no heap and no ordering of replica ids.
-///
 /// ```
 /// use merge_machines::{GCounter, Merge};
 ///

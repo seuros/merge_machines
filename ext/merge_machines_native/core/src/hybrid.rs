@@ -1,9 +1,6 @@
 //! A hybrid logical clock: timestamps near physical time that still order.
 
 /// A wall-clock reading paired with a counter that breaks its ties.
-///
-/// Ordered by `wall_ns` first and `counter` second, which makes the order
-/// total: two timestamps issued at the same reading still compare.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HybridTimestamp {
     /// The wall-clock reading this was issued at, in nanoseconds.
@@ -13,12 +10,6 @@ pub struct HybridTimestamp {
 }
 
 /// Issues timestamps that track physical time without ever going backwards.
-///
-/// A hybrid logical clock (Kulkarni et al., 2014) keeps the ordering guarantee
-/// of [`LogicalClock`](crate::LogicalClock) while staying within the clock
-/// error of physical time, so a timestamp is still useful to a human reading a
-/// log. When the wall clock stalls or steps backwards, the counter carries the
-/// order on its own.
 ///
 /// # The reading this wants
 ///
@@ -93,9 +84,6 @@ impl HybridClock {
     }
 
     /// Stamps the receipt of `observed` at wall-clock reading `wall_ns`.
-    ///
-    /// The result is above both the local history and the observed timestamp,
-    /// so causality survives a receiver whose clock is behind the sender's.
     pub const fn observe(&mut self, wall_ns: u64, observed: HybridTimestamp) -> HybridTimestamp {
         let latest = larger(wall_ns, larger(self.last.wall_ns, observed.wall_ns));
         let counter = if latest == self.last.wall_ns && latest == observed.wall_ns {

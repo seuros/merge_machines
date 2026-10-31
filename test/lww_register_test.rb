@@ -30,8 +30,8 @@ module MergeMachines
       assert_algebra(->(register) { register.value }) do
         left = LwwRegister.new(stamp: :hybrid)
         right = LwwRegister.new(stamp: :hybrid)
-        left.set('left', replica: 1, stamp: Timestamp.new(wall: 1.5, counter: 2))
-        right.set('right', replica: 2, stamp: Timestamp.new(wall: 1.5, counter: 2))
+        left.set('left', replica: 1, stamp: Timestamp.new(wall_ns: 1_500_000_000, counter: 2))
+        right.set('right', replica: 2, stamp: Timestamp.new(wall_ns: 1_500_000_000, counter: 2))
         [left, right]
       end
     end
@@ -68,13 +68,13 @@ module MergeMachines
 
     def test_a_blob_round_trips_a_hybrid_stamp
       register = LwwRegister.new(stamp: :hybrid)
-      register.set('v', replica: 1, stamp: Timestamp.new(wall: 2.5, counter: 3))
+      register.set('v', replica: 1, stamp: Timestamp.new(wall_ns: 2_500_000_000, counter: 3))
 
       restored = LwwRegister.load(register.dump)
 
       assert_equal :hybrid, restored.stamp_kind
       assert_equal 'v', restored.value
-      assert_equal Timestamp.new(wall: 2.5, counter: 3), restored.stamp
+      assert_equal Timestamp.new(wall_ns: 2_500_000_000, counter: 3), restored.stamp
     end
 
     def test_load_rejects_a_blob_it_did_not_write
@@ -92,14 +92,14 @@ module MergeMachines
       assert_raises(ArgumentError) { LwwRegister.load(frame) }
 
       hybrid = LwwRegister.new(stamp: :hybrid)
-      hybrid.set('payload', replica: 1, stamp: Timestamp.new(wall: 1.0, counter: 0))
+      hybrid.set('payload', replica: 1, stamp: Timestamp.new(wall_ns: 1_000_000_000, counter: 0))
 
       assert_raises(ArgumentError) { LwwRegister.load(hybrid.dump.byteslice(0, 35)) }
     end
 
     def test_load_rejects_a_hybrid_blob_cut_to_a_logical_frames_length
       hybrid = LwwRegister.new(stamp: :hybrid)
-      hybrid.set('v', replica: 1, stamp: Timestamp.new(wall: 1.0, counter: 0))
+      hybrid.set('v', replica: 1, stamp: Timestamp.new(wall_ns: 1_000_000_000, counter: 0))
 
       assert_raises(ArgumentError) { LwwRegister.load(hybrid.dump.byteslice(0, 27)) }
     end

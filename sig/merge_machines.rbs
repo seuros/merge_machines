@@ -24,9 +24,9 @@ module MergeMachines
   class Exhausted < Error
   end
 
-  # A wall-clock reading in seconds and the counter that breaks its ties.
+  # A wall-clock reading in nanoseconds and the counter that breaks its ties.
   class Timestamp < ::Data
-    attr_reader wall: Float
+    attr_reader wall_ns: Integer
     attr_reader counter: Integer
   end
 
@@ -220,16 +220,16 @@ module MergeMachines
     # The last timestamp this clock issued.
     def now: () -> Timestamp
 
-    # Stamps a local event at `wall`, in seconds, defaulting to the realtime
-    # clock's reading. Raises `Exhausted` when the reading has not advanced and
-    # the counter that separates two events at one reading holds its highest
-    # value, which leaves the clock where it was.
-    def tick: (?wall: Float) -> Timestamp
+    # Stamps a local event at `wall_ns`, defaulting to the realtime clock's
+    # reading. Raises `Exhausted` when the reading has not advanced and the
+    # counter that separates two events at one reading holds its highest value,
+    # which leaves the clock where it was.
+    def tick: (?wall_ns: Integer) -> Timestamp
 
-    # Stamps the receipt of the timestamp `wall` and `counter` name, at the
+    # Stamps the receipt of the timestamp `wall_ns` and `counter` name, at the
     # realtime clock's reading. Raises `Exhausted` when it cannot be stamped
     # after the timestamp observed.
-    def observe: (wall: Float, counter: Integer) -> Timestamp
+    def observe: (wall_ns: Integer, counter: Integer) -> Timestamp
 
     def dump: () -> String
     def inspect: () -> String

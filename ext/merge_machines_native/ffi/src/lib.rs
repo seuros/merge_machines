@@ -4,9 +4,8 @@
 //! dispatches the number it is given to a fixed set of monomorphised variants
 //! and raises `ArgumentError` for any other number.
 //!
-//! Wall-clock readings cross this boundary as seconds and move through the
-//! clocks as nanoseconds. [`to_ns`] and [`to_seconds`] are the only places
-//! either representation changes.
+//! Wall-clock readings are nanoseconds on both sides of this boundary.
+//! `NS_PER_SECOND` is exposed for callers holding seconds.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -57,16 +56,6 @@ pub(crate) fn field(value: usize) -> [u8; FIELD_LEN] {
         *slot = byte;
     }
     bytes
-}
-
-#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn to_ns(seconds: f64) -> u64 {
-    (seconds * f64::from(NS_PER_SECOND)).round() as u64
-}
-
-#[expect(clippy::cast_precision_loss)]
-pub(crate) fn to_seconds(nanoseconds: u64) -> f64 {
-    nanoseconds as f64 / f64::from(NS_PER_SECOND)
 }
 
 /// The one required keyword of a constructor.

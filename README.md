@@ -154,8 +154,8 @@ corrected backwards.
 ```ruby
 clock = MergeMachines::HybridClock.new(replica: 1)
 clock.tick                              # Timestamp, reading from the realtime clock
-clock.tick(wall: 1_700_000_000.5)       # or a reading you supply, in seconds
-clock.observe(wall: 1.5, counter: 3)    # a timestamp that arrived
+clock.tick(wall_ns: 1_700_000_000_500_000_000)  # or a reading you supply
+clock.observe(wall_ns: 1_500_000_000, counter: 3) # a timestamp that arrived
 clock.now                               # the last one issued
 ```
 
@@ -165,7 +165,8 @@ reading that really did advance resets that counter.
 
 ### The reading it wants is not a monotonic one
 
-`wall:` is physical time two machines can compare, and defaults to
+`wall_ns:` is physical time two machines can compare, in nanoseconds, and
+defaults to
 `Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond)`. That clock
 **steps backwards** when the host's is corrected, which is exactly why the
 counter exists.

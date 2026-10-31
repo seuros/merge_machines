@@ -50,26 +50,26 @@ impl Wrapper {
         timestamp(ruby, rb_self.clock.borrow().last())
     }
 
-    /// Stamps a local event at `wall:`, in seconds, defaulting to the
-    /// realtime clock.
+    /// Stamps a local event at `wall_ns:`, defaulting to the realtime clock.
     fn tick(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let wall_ns = match optional_kwarg::<f64>(args.keywords, "wall")? {
-            Some(seconds) => crate::to_ns(seconds),
+        let wall_ns = match optional_kwarg::<u64>(args.keywords, "wall_ns")? {
+            Some(nanoseconds) => nanoseconds,
             None => wall::now_ns(ruby)?,
         };
         let issued = rb_self.clock.borrow_mut().tick(wall_ns);
         timestamp(ruby, exhausted(ruby, issued)?)
     }
 
-    /// Stamps the receipt of the timestamp `wall:` and `counter:` name, at the
-    /// realtime clock's reading.
+    /// Stamps the receipt of the timestamp `wall_ns:` and `counter:` name, at
+    /// the realtime clock's reading.
     fn observe(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let (wall, counter) =
-            get_kwargs::<_, (f64, u64), (), ()>(args.keywords, &["wall", "counter"], &[])?.required;
+        let (wall_ns, counter) =
+            get_kwargs::<_, (u64, u64), (), ()>(args.keywords, &["wall_ns", "counter"], &[])?
+                .required;
         let now = wall::now_ns(ruby)?;
-        let observed = stamped(wall, counter);
+        let observed = stamped(wall_ns, counter);
         let issued = rb_self.clock.borrow_mut().observe(now, observed);
         timestamp(ruby, exhausted(ruby, issued)?)
     }
@@ -84,7 +84,7 @@ impl Wrapper {
     fn inspect(&self) -> String {
         let last = self.clock.borrow().last();
         format!(
-            "#<MergeMachines::HybridClock replica={} wall={} counter={}>",
+            "#<MergeMachines::HybridClock replica={} wall_ns={} counter={}>",
             self.replica, last.wall_ns, last.counter
         )
     }

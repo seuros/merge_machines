@@ -259,7 +259,7 @@ impl Wrapper {
 /// The timestamp a `Timestamp` names.
 fn hybrid(value: Value) -> Result<HybridTimestamp, Error> {
     Ok(stamped(
-        value.funcall("wall", ())?,
+        value.funcall("wall_ns", ())?,
         value.funcall("counter", ())?,
     ))
 }

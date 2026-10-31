@@ -13,8 +13,8 @@ use merge_machines::{Merge, OrSet, ReplicaId, Tag};
 use crate::hash::hash64;
 use crate::names::{self, Names, named};
 use crate::{
-    CAPACITIES, blob_shape, capacity, codec_error, mismatch, required_kwarg, unsupported,
-    unsupported_blob,
+    CAPACITIES, blob_shape, capacity, codec_error, mismatch, required_kwarg, tags_exhausted,
+    unsupported, unsupported_blob,
 };
 
 /// Tags minted in this process, so no two sets allocate the same one.
@@ -110,7 +110,10 @@ impl Wrapper {
         let replica: ReplicaId = required_kwarg(args.keywords, "replica")?;
 
         let element = hash64(key.as_bytes());
-        let tag = Tag::new(replica, rb_self.next_counter(replica));
+        let Some(counter) = rb_self.next_counter(replica) else {
+            return Err(tags_exhausted(ruby));
+        };
+        let tag = Tag::new(replica, counter);
         capacity(
             ruby,
             set!(&mut *rb_self.set.borrow_mut(), |set| set.add(element, tag)),
@@ -214,7 +217,11 @@ impl Wrapper {
 
     /// A counter no tag in this process has used, and above anything this
     /// replica already used in this set.
-    fn next_counter(&self, replica: ReplicaId) -> u64 {
+    ///
+    /// `None` once either counter has nothing left to count: reusing a tag
+    /// would make the core take the add for one it already holds and drop the
+    /// key without a word.
+    fn next_counter(&self, replica: ReplicaId) -> Option<u64> {
         let used = |tag: Tag| (tag.replica == replica).then_some(tag.counter);
         let highest = set!(&*self.set.borrow(), |set| set
             .adds()
@@ -224,8 +231,12 @@ impl Wrapper {
             .max())
         .unwrap_or(0);
 
-        let minted = MINTED.fetch_add(1, Ordering::Relaxed);
-        highest.max(minted).saturating_add(1)
+        let minted = MINTED
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |minted| {
+                minted.checked_add(1)
+            })
+            .ok()?;
+        highest.max(minted).checked_add(1)
     }
 }
 

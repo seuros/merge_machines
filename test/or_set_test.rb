@@ -4,6 +4,17 @@ require 'test_helper'
 
 module MergeMachines
   class OrSetTest < StateTest
+    # Bytes a 64-bit field takes in a blob.
+    FIELD_BYTES = 8
+
+    # The frame header: the tag, the capacity, how many adds and how many
+    # tombstones the frame carries.
+    HEADER_BYTES = 7
+
+    # Where the first add record's counter sits: after the header, the element
+    # and the tag's replica.
+    COUNTER_AT = HEADER_BYTES + (2 * FIELD_BYTES)
+
     def test_every_supported_capacity_is_monomorphised
       [64, 256, 1024].each do |capacity|
         assert_equal capacity, OrSet.new(capacity: capacity).capacity
@@ -109,6 +120,17 @@ module MergeMachines
       assert_drops_rejected_keys(target) do |key|
         OrSet.new(capacity: 64).tap { |rejected| rejected.add(key, replica: 3) }
       end
+    end
+
+    def test_a_replica_that_ran_out_of_counters_reports_it_instead_of_dropping_the_key
+      set = OrSet.new(capacity: 64)
+      set.add('a', replica: 1)
+      blob = set.dump
+      blob[COUNTER_AT, FIELD_BYTES] = [(2**64) - 1].pack('Q<')
+      saturated = OrSet.load(blob)
+
+      assert_raises(Exhausted) { saturated.add('b', replica: 1) }
+      assert_equal %w[a], saturated.members
     end
 
     def test_a_key_that_is_not_utf_8_is_rejected

@@ -157,8 +157,9 @@ module MergeMachines
     def capacity: () -> Integer
 
     # Adds `key` under a tag of `replica` and the next counter that replica has
-    # not used here. Raises `Full` when every add slot is taken,
-    # `EncodingError` when `key` is not UTF-8.
+    # not used here. Raises `Full` when every add slot is taken, `Exhausted`
+    # when `replica` has no counter left, `EncodingError` when `key` is not
+    # UTF-8.
     def add: (String key, replica: Integer) -> nil
 
     # Tombstones every tag this set has seen for `key`. Raises `Full` when the

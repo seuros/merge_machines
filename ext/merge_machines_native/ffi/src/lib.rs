@@ -149,6 +149,11 @@ pub(crate) fn exhausted<T>(ruby: &Ruby, outcome: Result<T, ClockExhausted>) -> R
     outcome.map_err(|error| raised(ruby, &EXHAUSTED, error.to_string()))
 }
 
+/// Raises `MergeMachines::Exhausted` for a set that ran out of tags.
+pub(crate) fn tags_exhausted(ruby: &Ruby) -> Error {
+    raised(ruby, &EXHAUSTED, "no tag left".to_owned())
+}
+
 fn raised(ruby: &Ruby, class: &OnceLock<Opaque<ExceptionClass>>, message: String) -> Error {
     class.get().map_or_else(
         || uninitialised(ruby),

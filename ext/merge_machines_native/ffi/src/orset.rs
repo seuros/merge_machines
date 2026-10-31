@@ -14,7 +14,7 @@ use crate::hash::hash64;
 use crate::names::{self, Names};
 use crate::shape::{frame_len_of, shaped};
 use crate::{
-    CAPACITIES, blob_shape, capacity, mismatch, required_kwarg, tags_exhausted, unsupported,
+    CAPACITIES, Whole, blob_shape, capacity, mismatch, required_kwarg, tags_exhausted, unsupported,
     unsupported_blob,
 };
 
@@ -52,7 +52,7 @@ const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
 impl Wrapper {
     fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let capacity: usize = required_kwarg(args.keywords, "capacity")?;
+        let Whole(capacity): Whole<usize> = required_kwarg(args.keywords, "capacity")?;
         Ok(Self {
             set: RefCell::new(dispatch(ruby, capacity, None)?),
             names: RefCell::new(Names::new()),
@@ -87,7 +87,7 @@ impl Wrapper {
     fn add(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (key,) = args.required;
-        let replica: ReplicaId = required_kwarg(args.keywords, "replica")?;
+        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
 
         let element = hash64(key.as_bytes());
         let Some(counter) = rb_self.next_counter(replica) else {

@@ -9,7 +9,9 @@ use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prel
 use merge_machines::{HybridClock, ReplicaId};
 
 use crate::data::{stamped, timestamp};
-use crate::{codec_error, exhausted, optional_kwarg, required_kwarg, trailing_replica, wall};
+use crate::{
+    Whole, codec_error, exhausted, optional_kwarg, required_kwarg, trailing_replica, wall,
+};
 
 /// A clock and the replica whose events it stamps, which the core does not
 /// hold.
@@ -22,9 +24,10 @@ struct Wrapper {
 impl Wrapper {
     fn new(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
         Ok(Self {
             clock: RefCell::new(HybridClock::new()),
-            replica: required_kwarg(args.keywords, "replica")?,
+            replica,
         })
     }
 
@@ -53,8 +56,8 @@ impl Wrapper {
     /// Stamps a local event at `wall_ns:`, defaulting to the realtime clock.
     fn tick(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let wall_ns = match optional_kwarg::<u64>(args.keywords, "wall_ns")? {
-            Some(nanoseconds) => nanoseconds,
+        let wall_ns = match optional_kwarg::<Whole<u64>>(args.keywords, "wall_ns")? {
+            Some(Whole(nanoseconds)) => nanoseconds,
             None => wall::now_ns(ruby)?,
         };
         let issued = rb_self.clock.borrow_mut().tick(wall_ns);
@@ -65,9 +68,12 @@ impl Wrapper {
     /// the realtime clock's reading.
     fn observe(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let (wall_ns, counter) =
-            get_kwargs::<_, (u64, u64), (), ()>(args.keywords, &["wall_ns", "counter"], &[])?
-                .required;
+        let (Whole(wall_ns), Whole(counter)) = get_kwargs::<_, (Whole<u64>, Whole<u64>), (), ()>(
+            args.keywords,
+            &["wall_ns", "counter"],
+            &[],
+        )?
+        .required;
         let now = wall::now_ns(ruby)?;
         let observed = stamped(wall_ns, counter);
         let issued = rb_self.clock.borrow_mut().observe(now, observed);

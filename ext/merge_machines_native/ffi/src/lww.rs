@@ -6,9 +6,7 @@ use std::cell::RefCell;
 use bytes::Bytes;
 use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::typed_data::Obj;
-use magnus::{
-    Error, RHash, RModule, RString, Ruby, Symbol, TryConvert, Value, function, method, prelude::*,
-};
+use magnus::{Error, RHash, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
 use merge_machines::{
     CodecError, HybridTimestamp, LwwRegister, Merge, ReplicaId, STAMP_HYBRID, STAMP_LOGICAL, Stamp,
 };
@@ -17,7 +15,7 @@ use crate::data::{stamped, timestamp};
 use crate::hash::hash64;
 use crate::names::{self, Names};
 use crate::shape::{Framed, boxed_decode, boxed_new, frame_len_of};
-use crate::{codec_error, mismatch, optional_kwarg};
+use crate::{Whole, codec_error, mismatch, optional_kwarg};
 
 /// Which clock stamps a register's writes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -214,16 +212,17 @@ impl Wrapper {
     fn set(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<(), Error> {
         let args = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
         let (value,) = args.required;
-        let (replica, stamp) =
-            get_kwargs::<_, (ReplicaId, Value), (), ()>(args.keywords, &["replica", "stamp"], &[])?
-                .required;
+        let (Whole(replica), stamp) = get_kwargs::<_, (Whole<ReplicaId>, Value), (), ()>(
+            args.keywords,
+            &["replica", "stamp"],
+            &[],
+        )?
+        .required;
 
         let element = hash64(value.as_bytes());
         let kind = rb_self.kind();
         let write = match kind {
-            Kind::Logical => {
-                Register::Logical(boxed_write(element, u64::try_convert(stamp)?, replica))
-            }
+            Kind::Logical => Register::Logical(boxed_write(element, logical(stamp)?, replica)),
             Kind::Hybrid => Register::Hybrid(boxed_write(element, hybrid(stamp)?, replica)),
         };
         folded(ruby, &mut rb_self.slot.borrow_mut(), &Slot::Held(write))?;
@@ -302,12 +301,16 @@ fn folded(ruby: &Ruby, slot: &mut Slot, other: &Slot) -> Result<(), Error> {
         .map_err(|ClockMismatch| mismatch(ruby, "register"))
 }
 
+/// The counter a `stamp:` names.
+fn logical(value: Value) -> Result<u64, Error> {
+    Whole::try_convert(value).map(|Whole(stamp)| stamp)
+}
+
 /// The timestamp a `Timestamp` names.
 fn hybrid(value: Value) -> Result<HybridTimestamp, Error> {
-    Ok(stamped(
-        value.funcall("wall_ns", ())?,
-        value.funcall("counter", ())?,
-    ))
+    let Whole(wall_ns) = value.funcall::<_, _, Whole<u64>>("wall_ns", ())?;
+    let Whole(counter) = value.funcall::<_, _, Whole<u64>>("counter", ())?;
+    Ok(stamped(wall_ns, counter))
 }
 
 /// Which clock a `stamp:` keyword asks for, defaulting to the logical one.

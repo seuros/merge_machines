@@ -10,7 +10,7 @@ use merge_machines::{GCounter, ReplicaId};
 
 use crate::shape::shaped;
 use crate::{
-    REPLICAS, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
+    REPLICAS, Whole, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
 };
 
 /// The counter at a single replica count.
@@ -40,7 +40,7 @@ const fn replicas_of<const R: usize>(_: &Held<R>) -> usize {
 impl Wrapper {
     fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let replicas: usize = required_kwarg(args.keywords, "replicas")?;
+        let Whole(replicas): Whole<usize> = required_kwarg(args.keywords, "replicas")?;
         Ok(Self(RefCell::new(dispatch(ruby, replicas, None)?)))
     }
 
@@ -68,7 +68,7 @@ impl Wrapper {
     /// What `replica:` has added.
     fn count(&self, args: &[Value]) -> Result<u64, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let replica: ReplicaId = required_kwarg(args.keywords, "replica")?;
+        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
         Ok(counter!(&*self.0.borrow(), |counter| counter.count(replica)))
     }
 
@@ -103,11 +103,14 @@ impl Wrapper {
 
 /// The `replica:` an increment is credited to and the `by:` it adds.
 pub fn increment_args(keywords: RHash) -> Result<(ReplicaId, u64), Error> {
-    let keywords =
-        get_kwargs::<_, (ReplicaId,), (Option<u64>,), ()>(keywords, &["replica"], &["by"])?;
-    let (replica,) = keywords.required;
+    let keywords = get_kwargs::<_, (Whole<ReplicaId>,), (Option<Whole<u64>>,), ()>(
+        keywords,
+        &["replica"],
+        &["by"],
+    )?;
+    let (Whole(replica),) = keywords.required;
     let (by,) = keywords.optional;
-    Ok((replica, by.unwrap_or(1)))
+    Ok((replica, by.map_or(1, |Whole(by)| by)))
 }
 
 /// The variant for `replicas`, read from `blob` when there is one.

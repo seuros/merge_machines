@@ -12,7 +12,8 @@ use crate::hash::hash64;
 use crate::names::{self, Names};
 use crate::shape::{frame_len_of, shaped};
 use crate::{
-    CAPACITIES, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
+    CAPACITIES, Whole, blob_shape, capacity, mismatch, required_kwarg, unsupported,
+    unsupported_blob,
 };
 
 /// The set at a single capacity, over the 64-bit hash each key becomes.
@@ -46,7 +47,7 @@ const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
 impl Wrapper {
     fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let capacity: usize = required_kwarg(args.keywords, "capacity")?;
+        let Whole(capacity): Whole<usize> = required_kwarg(args.keywords, "capacity")?;
         Ok(Self {
             set: RefCell::new(dispatch(ruby, capacity, None)?),
             names: RefCell::new(Names::new()),

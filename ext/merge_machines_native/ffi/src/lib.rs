@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use magnus::scan_args::get_kwargs;
 use magnus::value::Opaque;
-use magnus::{Error, ExceptionClass, RHash, RModule, Ruby, TryConvert, prelude::*};
+use magnus::{Error, ExceptionClass, Integer, RHash, RModule, Ruby, TryConvert, Value, prelude::*};
 use merge_machines::{CapacityError, ClockExhausted, CodecError, ReplicaId};
 
 /// `MergeMachines::Full`, defined in [`init`].
@@ -57,6 +57,37 @@ pub(crate) fn field(value: usize) -> [u8; FIELD_LEN] {
         *slot = byte;
     }
     bytes
+}
+
+/// A whole number of things: a stamp, a replica, a capacity, a counter, a
+/// nanosecond reading.
+///
+/// magnus reads an integer through Ruby's `NUM2*` family, which truncates a
+/// `Float` towards zero instead of refusing it, so an argument that means an
+/// integer is read as one of these and anything but an `Integer` is turned
+/// away. An `Integer` outside the target width still comes back as the
+/// `RangeError` magnus raises for it.
+pub(crate) struct Whole<T>(pub(crate) T);
+
+impl<T: TryConvert> TryConvert for Whole<T> {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        if Integer::from_value(value).is_none() {
+            return Err(not_whole(value));
+        }
+        T::try_convert(value).map(Self)
+    }
+}
+
+fn not_whole(value: Value) -> Error {
+    let ruby = Ruby::get_with(value);
+    Error::new(
+        ruby.exception_type_error(),
+        format!(
+            "no implicit conversion of {} into Integer: {}",
+            value.class(),
+            value.inspect()
+        ),
+    )
 }
 
 /// The one required keyword of a constructor.

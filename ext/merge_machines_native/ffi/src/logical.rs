@@ -7,7 +7,7 @@ use magnus::scan_args::scan_args;
 use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
 use merge_machines::{LogicalClock, ReplicaId};
 
-use crate::{codec_error, exhausted, required_kwarg, trailing_replica};
+use crate::{Whole, codec_error, exhausted, required_kwarg, trailing_replica};
 
 /// A clock and the replica whose events it stamps, which the core does not
 /// hold.
@@ -20,9 +20,10 @@ struct Wrapper {
 impl Wrapper {
     fn new(args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
         Ok(Self {
             clock: RefCell::new(LogicalClock::new()),
-            replica: required_kwarg(args.keywords, "replica")?,
+            replica,
         })
     }
 
@@ -54,7 +55,7 @@ impl Wrapper {
     }
 
     /// Stamps the receipt of `observed`, a stamp from another replica.
-    fn observe(ruby: &Ruby, rb_self: &Self, observed: u64) -> Result<u64, Error> {
+    fn observe(ruby: &Ruby, rb_self: &Self, Whole(observed): Whole<u64>) -> Result<u64, Error> {
         exhausted(ruby, rb_self.clock.borrow_mut().observe(observed))
     }
 

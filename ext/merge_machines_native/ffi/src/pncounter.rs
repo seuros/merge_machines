@@ -11,7 +11,7 @@ use merge_machines::PNCounter;
 use crate::gcounter::increment_args;
 use crate::shape::shaped;
 use crate::{
-    REPLICAS, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
+    REPLICAS, Whole, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
 };
 
 /// The counter at a single replica count.
@@ -41,7 +41,7 @@ const fn replicas_of<const R: usize>(_: &Held<R>) -> usize {
 impl Wrapper {
     fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let replicas: usize = required_kwarg(args.keywords, "replicas")?;
+        let Whole(replicas): Whole<usize> = required_kwarg(args.keywords, "replicas")?;
         Ok(Self(RefCell::new(dispatch(ruby, replicas, None)?)))
     }
 

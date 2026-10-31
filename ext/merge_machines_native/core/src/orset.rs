@@ -1,8 +1,11 @@
 //! Observed-remove set: a remove only takes out the adds it has seen.
 
+#[cfg(feature = "alloc")]
+use crate::boxed_frame;
 use crate::{
     COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN,
-    TAG_ORSET, free_slot, read_small, read_u64, same_elements, small_field,
+    TAG_ORSET, free_slot, read_small, read_u64, same_elements, small_field, tagged_frame,
+    write_into,
 };
 
 /// Bytes one tombstone record occupies: the tag's replica then its counter.
@@ -204,20 +207,14 @@ impl<const N: usize> OrSet<u64, N> {
     /// [`CodecError::Truncated`] when `out` is shorter than
     /// [`ENCODED_LEN`](Self::ENCODED_LEN).
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        self.write_frame(frame);
-        Ok(Self::ENCODED_LEN)
+        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     #[cfg(feature = "alloc")]
     #[must_use]
     pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
-        self.write_frame(&mut frame);
-        frame
+        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
@@ -261,12 +258,7 @@ impl<const N: usize> OrSet<u64, N> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
-        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        if frame[TAG] != TAG_ORSET {
-            return Err(CodecError::Tag);
-        }
+        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_ORSET)?;
         if read_small(&frame[SHAPE]) != N {
             return Err(CodecError::Parameters);
         }

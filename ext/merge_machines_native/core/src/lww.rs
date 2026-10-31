@@ -1,8 +1,10 @@
 //! Last writer wins, with the replica id as the tie-break.
 
+#[cfg(feature = "alloc")]
+use crate::boxed_frame;
 use crate::{
     CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_LWW_REGISTER, read_small,
-    read_u64, small_field,
+    read_u64, small_field, tagged_frame, write_into,
 };
 use core::convert::Infallible;
 
@@ -142,20 +144,14 @@ impl<S: Stamp> LwwRegister<u64, S> {
     /// [`CodecError::Truncated`] when `out` is shorter than
     /// [`ENCODED_LEN`](Self::ENCODED_LEN).
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        self.write_frame(frame);
-        Ok(Self::ENCODED_LEN)
+        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// The register's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     #[cfg(feature = "alloc")]
     #[must_use]
     pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
-        self.write_frame(&mut frame);
-        frame
+        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
@@ -188,12 +184,7 @@ impl<S: Stamp> LwwRegister<u64, S> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
-        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        if frame[TAG] != TAG_LWW_REGISTER {
-            return Err(CodecError::Tag);
-        }
+        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LWW_REGISTER)?;
         if read_small(&frame[STAMP_KIND]) != usize::from(S::KIND) {
             return Err(CodecError::Parameters);
         }

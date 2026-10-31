@@ -16,6 +16,7 @@ use merge_machines::{
 use crate::data::{stamped, timestamp};
 use crate::hash::hash64;
 use crate::names::{self, Names};
+use crate::shape::{Framed, boxed_decode, boxed_new, frame_len_of};
 use crate::{codec_error, mismatch, optional_kwarg};
 
 /// Which clock stamps a register's writes.
@@ -140,34 +141,27 @@ struct Wrapper {
     names: RefCell<Names>,
 }
 
-const fn frame_len_of<S: Stamp>(_: &LwwRegister<u64, S>) -> usize {
-    LwwRegister::<u64, S>::ENCODED_LEN
+impl<S: Stamp> Framed for LwwRegister<u64, S> {
+    const FRAME_LEN: usize = Self::ENCODED_LEN;
+
+    fn blank() -> Self {
+        Self::new(0, S::default(), 0)
+    }
+
+    fn read_frame(&mut self, frame: &[u8]) -> Result<(), CodecError> {
+        self.decode_into(frame)
+    }
 }
 
-/// Whether a frame carries a write rather than the state [`boxed_new`]
-/// constructs.
+/// Whether a frame carries a write rather than the state a register starts out
+/// holding.
 fn holds_write<S: Stamp>(register: &LwwRegister<u64, S>) -> bool {
-    *register != LwwRegister::new(0, S::default(), 0)
-}
-
-/// Each shape is constructed behind its own call frame.
-#[inline(never)]
-fn boxed_new<S: Stamp>() -> Box<LwwRegister<u64, S>> {
-    Box::new(LwwRegister::new(0, S::default(), 0))
+    *register != LwwRegister::blank()
 }
 
 #[inline(never)]
 fn boxed_write<S: Stamp>(element: u64, stamp: S, replica: ReplicaId) -> Box<LwwRegister<u64, S>> {
     Box::new(LwwRegister::new(element, stamp, replica))
-}
-
-#[inline(never)]
-fn boxed_decode<S: Stamp>(ruby: &Ruby, frame: &[u8]) -> Result<Box<LwwRegister<u64, S>>, Error> {
-    let mut register = boxed_new::<S>();
-    register
-        .decode_into(frame)
-        .map_err(|error| codec_error(ruby, error))?;
-    Ok(register)
 }
 
 impl Wrapper {
@@ -340,12 +334,10 @@ fn requested_kind(ruby: &Ruby, given: Option<Value>) -> Result<Kind, Error> {
 /// The variant for `kind`, read from `blob` when there is one.
 fn dispatch(ruby: &Ruby, kind: Kind, blob: Option<&[u8]>) -> Result<Register, Error> {
     match (kind, blob) {
-        (Kind::Logical, None) => Ok(Register::Logical(boxed_new::<u64>())),
-        (Kind::Hybrid, None) => Ok(Register::Hybrid(boxed_new::<HybridTimestamp>())),
-        (Kind::Logical, Some(frame)) => Ok(Register::Logical(boxed_decode::<u64>(ruby, frame)?)),
-        (Kind::Hybrid, Some(frame)) => Ok(Register::Hybrid(boxed_decode::<HybridTimestamp>(
-            ruby, frame,
-        )?)),
+        (Kind::Logical, None) => Ok(Register::Logical(boxed_new())),
+        (Kind::Hybrid, None) => Ok(Register::Hybrid(boxed_new())),
+        (Kind::Logical, Some(frame)) => Ok(Register::Logical(boxed_decode(ruby, frame)?)),
+        (Kind::Hybrid, Some(frame)) => Ok(Register::Hybrid(boxed_decode(ruby, frame)?)),
     }
 }
 

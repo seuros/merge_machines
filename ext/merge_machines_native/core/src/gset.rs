@@ -1,8 +1,10 @@
 //! A set that only grows.
 
+#[cfg(feature = "alloc")]
+use crate::boxed_frame;
 use crate::{
     COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, SHAPE_LEN, TAG, TAG_GSET, TAG_LEN,
-    free_slot, read_small, read_u64, same_elements, small_field,
+    free_slot, read_small, read_u64, same_elements, small_field, tagged_frame, write_into,
 };
 
 /// Where the shape sits in a frame.
@@ -90,20 +92,14 @@ impl<const N: usize> GSet<u64, N> {
     /// [`CodecError::Truncated`] when `out` is shorter than
     /// [`ENCODED_LEN`](Self::ENCODED_LEN).
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        self.write_frame(frame);
-        Ok(Self::ENCODED_LEN)
+        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     #[cfg(feature = "alloc")]
     #[must_use]
     pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
-        self.write_frame(&mut frame);
-        frame
+        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
@@ -140,12 +136,7 @@ impl<const N: usize> GSet<u64, N> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
-        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        if frame[TAG] != TAG_GSET {
-            return Err(CodecError::Tag);
-        }
+        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GSET)?;
         if read_small(&frame[SHAPE]) != N {
             return Err(CodecError::Parameters);
         }

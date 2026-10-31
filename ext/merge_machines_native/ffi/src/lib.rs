@@ -19,6 +19,7 @@ mod lww;
 mod names;
 mod orset;
 mod pncounter;
+mod shape;
 mod wall;
 
 use std::sync::OnceLock;

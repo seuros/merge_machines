@@ -8,25 +8,23 @@ use bytes::Bytes;
 use magnus::scan_args::scan_args;
 use magnus::typed_data::Obj;
 use magnus::{Error, RArray, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
-use merge_machines::{Merge, OrSet, ReplicaId, Tag};
+use merge_machines::{OrSet, ReplicaId, Tag};
 
 use crate::hash::hash64;
-use crate::names::{self, Names, named};
+use crate::names::{self, Names};
+use crate::shape::{frame_len_of, shaped};
 use crate::{
-    CAPACITIES, blob_shape, capacity, codec_error, mismatch, required_kwarg, tags_exhausted,
-    unsupported, unsupported_blob,
+    CAPACITIES, blob_shape, capacity, mismatch, required_kwarg, tags_exhausted, unsupported,
+    unsupported_blob,
 };
 
 /// Tags minted in this process, so no two sets allocate the same one.
 static MINTED: AtomicU64 = AtomicU64::new(0);
 
-/// A set at one of the monomorphised capacities.
-#[derive(Clone)]
-enum Set {
-    N64(Box<OrSet<u64, 64>>),
-    N256(Box<OrSet<u64, 256>>),
-    N1024(Box<OrSet<u64, 1024>>),
-}
+/// The set at a single capacity, over the 64-bit hash each key becomes.
+type Held<const N: usize> = OrSet<u64, N>;
+
+shaped!(Set over Held { N64 = 64, N256 = 256, N1024 = 1024 });
 
 /// Runs `body` against whichever variant is held.
 macro_rules! set {
@@ -47,26 +45,8 @@ struct Wrapper {
     names: RefCell<Names>,
 }
 
-const fn capacity_of<const N: usize>(_: &OrSet<u64, N>) -> usize {
+const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
     N
-}
-
-const fn frame_len_of<const N: usize>(_: &OrSet<u64, N>) -> usize {
-    OrSet::<u64, N>::ENCODED_LEN
-}
-
-/// Each shape is constructed behind its own call frame.
-#[inline(never)]
-fn boxed_new<const N: usize>() -> Box<OrSet<u64, N>> {
-    Box::new(OrSet::new())
-}
-
-#[inline(never)]
-fn boxed_decode<const N: usize>(ruby: &Ruby, frame: &[u8]) -> Result<Box<OrSet<u64, N>>, Error> {
-    let mut set = boxed_new::<N>();
-    set.decode_into(frame)
-        .map_err(|error| codec_error(ruby, error))?;
-    Ok(set)
 }
 
 impl Wrapper {
@@ -141,12 +121,7 @@ impl Wrapper {
         let elements = set!(&*rb_self.set.borrow(), |set| set
             .iter()
             .collect::<Vec<u64>>());
-        let names = rb_self.names.borrow();
-        let members = ruby.ary_new_capa(elements.len());
-        for element in elements {
-            members.push(ruby.str_new(&named(ruby, &names, element)?))?;
-        }
-        Ok(members)
+        names::members(ruby, &rb_self.names.borrow(), &elements)
     }
 
     fn size(&self) -> usize {
@@ -160,11 +135,8 @@ impl Wrapper {
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: &Self) -> Result<Obj<Self>, Error> {
         let source = other.set.borrow().clone();
         let names = other.names.borrow().clone();
-        let folded = match (&mut *rb_self.set.borrow_mut(), &source) {
-            (Set::N64(target), Set::N64(source)) => target.merge(source),
-            (Set::N256(target), Set::N256(source)) => target.merge(source),
-            (Set::N1024(target), Set::N1024(source)) => target.merge(source),
-            _ => return Err(mismatch(ruby, "set")),
+        let Some(folded) = rb_self.set.borrow_mut().absorb(&source) else {
+            return Err(mismatch(ruby, "set"));
         };
         rb_self.names.borrow_mut().extend(names);
         rb_self.prune();
@@ -242,16 +214,12 @@ impl Wrapper {
 
 /// The variant for `capacity`, read from `blob` when there is one.
 fn dispatch(ruby: &Ruby, capacity: usize, blob: Option<&[u8]>) -> Result<Set, Error> {
-    match (capacity, blob) {
-        (64, None) => Ok(Set::N64(boxed_new::<64>())),
-        (256, None) => Ok(Set::N256(boxed_new::<256>())),
-        (1024, None) => Ok(Set::N1024(boxed_new::<1024>())),
-        (64, Some(frame)) => Ok(Set::N64(boxed_decode::<64>(ruby, frame)?)),
-        (256, Some(frame)) => Ok(Set::N256(boxed_decode::<256>(ruby, frame)?)),
-        (1024, Some(frame)) => Ok(Set::N1024(boxed_decode::<1024>(ruby, frame)?)),
-        (_, None) => Err(unsupported(ruby, "capacity", capacity, &CAPACITIES)),
-        (_, Some(_)) => Err(unsupported_blob(ruby, "capacity", &CAPACITIES)),
-    }
+    let Some(frame) = blob else {
+        return Set::blank(capacity)
+            .ok_or_else(|| unsupported(ruby, "capacity", capacity, &CAPACITIES));
+    };
+    Set::decoded(ruby, capacity, frame)
+        .unwrap_or_else(|| Err(unsupported_blob(ruby, "capacity", &CAPACITIES)))
 }
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {

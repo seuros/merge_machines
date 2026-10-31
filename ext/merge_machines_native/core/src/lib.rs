@@ -164,6 +164,39 @@ pub(crate) fn read_small(field: &[u8]) -> usize {
     usize::from(u16::from_le_bytes(bytes))
 }
 
+/// Writes a frame of `len` bytes at the front of `out` through `fill`,
+/// returning the number of bytes written.
+pub(crate) fn write_into(
+    out: &mut [u8],
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<usize, CodecError> {
+    let Some(frame) = out.get_mut(..len) else {
+        return Err(CodecError::Truncated);
+    };
+    fill(frame);
+    Ok(len)
+}
+
+/// A frame of exactly `len` bytes, filled by `fill`.
+#[cfg(feature = "alloc")]
+pub(crate) fn boxed_frame(len: usize, fill: impl FnOnce(&mut [u8])) -> alloc::boxed::Box<[u8]> {
+    let mut frame = alloc::vec![0_u8; len].into_boxed_slice();
+    fill(&mut frame);
+    frame
+}
+
+/// The `len`-byte frame `bytes` leads with, which `tag` has to name.
+pub(crate) fn tagged_frame(bytes: &[u8], len: usize, tag: u8) -> Result<&[u8], CodecError> {
+    let Some(frame) = bytes.get(..len) else {
+        return Err(CodecError::Truncated);
+    };
+    if frame[TAG] != tag {
+        return Err(CodecError::Tag);
+    }
+    Ok(frame)
+}
+
 /// Whether two slot arrays hold the same elements, ignoring where in the array
 /// each one sits.
 pub(crate) fn same_elements<T: PartialEq>(left: &[Option<T>], right: &[Option<T>]) -> bool {

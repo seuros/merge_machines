@@ -1,6 +1,11 @@
 //! Lamport's logical clock: ordering events without reading a clock.
 
-use crate::{ClockExhausted, CodecError, FIELD_LEN, TAG, TAG_LEN, TAG_LOGICAL_CLOCK, read_u64};
+#[cfg(feature = "alloc")]
+use crate::boxed_frame;
+use crate::{
+    ClockExhausted, CodecError, FIELD_LEN, TAG, TAG_LEN, TAG_LOGICAL_CLOCK, read_u64, tagged_frame,
+    write_into,
+};
 
 /// Where the counter sits in a frame.
 const COUNTER: core::ops::Range<usize> = TAG_LEN..TAG_LEN + FIELD_LEN;
@@ -88,20 +93,14 @@ impl LogicalClock {
     /// [`CodecError::Truncated`] when `out` is shorter than
     /// [`ENCODED_LEN`](Self::ENCODED_LEN).
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let Some(frame) = out.get_mut(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        self.write_frame(frame);
-        Ok(Self::ENCODED_LEN)
+        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// The clock's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     #[cfg(feature = "alloc")]
     #[must_use]
     pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        let mut frame = alloc::vec![0_u8; Self::ENCODED_LEN].into_boxed_slice();
-        self.write_frame(&mut frame);
-        frame
+        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
     }
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
@@ -130,12 +129,7 @@ impl LogicalClock {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
-        let Some(frame) = bytes.get(..Self::ENCODED_LEN) else {
-            return Err(CodecError::Truncated);
-        };
-        if frame[TAG] != TAG_LOGICAL_CLOCK {
-            return Err(CodecError::Tag);
-        }
+        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LOGICAL_CLOCK)?;
         self.counter = read_u64(&frame[COUNTER]);
         Ok(())
     }

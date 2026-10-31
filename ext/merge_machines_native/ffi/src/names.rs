@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use magnus::{Error, Ruby};
+use magnus::{Error, RArray, Ruby};
 
 use crate::hash::hash64;
 use crate::{FIELD_LEN, field};
@@ -54,8 +54,18 @@ pub fn complete(
     }
 }
 
+/// The strings `elements` came from, as a Ruby array in the order the core
+/// reported them.
+pub fn members(ruby: &Ruby, names: &Names, elements: &[u64]) -> Result<RArray, Error> {
+    let members = ruby.ary_new_capa(elements.len());
+    for element in elements {
+        members.push(ruby.str_new(&named(ruby, names, *element)?))?;
+    }
+    Ok(members)
+}
+
 /// The string an element came from.
-pub fn named(ruby: &Ruby, names: &Names, element: u64) -> Result<String, Error> {
+fn named(ruby: &Ruby, names: &Names, element: u64) -> Result<String, Error> {
     names.get(&element).cloned().ok_or_else(|| {
         Error::new(
             ruby.exception_runtime_error(),

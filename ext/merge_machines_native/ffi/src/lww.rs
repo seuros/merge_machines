@@ -65,6 +65,12 @@ const fn frame_len_of<S: Stamp>(_: &LwwRegister<u64, S>) -> usize {
     LwwRegister::<u64, S>::ENCODED_LEN
 }
 
+/// Whether a frame carries a write rather than the state [`boxed_new`]
+/// constructs.
+fn holds_write<S: Stamp>(register: &LwwRegister<u64, S>) -> bool {
+    *register != LwwRegister::new(0, S::default(), 0)
+}
+
 /// Each shape is constructed behind its own call frame.
 #[inline(never)]
 fn boxed_new<S: Stamp>() -> Box<LwwRegister<u64, S>> {
@@ -97,6 +103,10 @@ impl Wrapper {
         let register = dispatch(ruby, kind, Some(&blob))?;
         let frame_len = register!(&register, |inner| frame_len_of(&**inner));
         let names = names::read(ruby, &blob[frame_len..])?;
+        if register!(&register, |inner| holds_write(&**inner)) {
+            let held = register!(&register, |inner| *inner.value());
+            names::complete(ruby, &names, core::iter::once(held))?;
+        }
 
         Ok(Self::holding(register, names))
     }

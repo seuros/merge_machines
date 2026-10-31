@@ -84,6 +84,19 @@ module MergeMachines
       assert_raises(ArgumentError) { LwwRegister.load("\x71\x07\x00".b + ("\x00".b * 40)) }
     end
 
+    def test_load_rejects_a_blob_whose_key_table_lost_the_held_value
+      register = LwwRegister.new
+      register.set('payload', replica: 1, stamp: 7)
+      frame = register.dump.byteslice(0, 27)
+
+      assert_raises(ArgumentError) { LwwRegister.load(frame) }
+
+      hybrid = LwwRegister.new(stamp: :hybrid)
+      hybrid.set('payload', replica: 1, stamp: Timestamp.new(wall: 1.0, counter: 0))
+
+      assert_raises(ArgumentError) { LwwRegister.load(hybrid.dump.byteslice(0, 35)) }
+    end
+
     def test_load_rejects_a_hybrid_blob_cut_to_a_logical_frames_length
       hybrid = LwwRegister.new(stamp: :hybrid)
       hybrid.set('v', replica: 1, stamp: Timestamp.new(wall: 1.0, counter: 0))

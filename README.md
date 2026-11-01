@@ -1,11 +1,20 @@
-# MergeMachines
+# MergeMachines 🔀
+
+> **Two ships, one log, no argument.** The tender that lets separated crews write
+> their own records and still agree when the fleet regroups.
 
 Conflict-free replicated data types for Ruby, and the clocks that stamp them.
 
 Two processes that both edited the same thing have to agree on the result
 without asking each other. These states merge commutatively, associatively and
 idempotently, so a replica converges on the same value whatever order the
-updates arrived in and however many times one of them arrived.
+updates arrived in and however many times one of them arrived. **AMS Lamport**
+runs under comms blackout by design: it never calls home, it reconciles on
+contact.
+
+---
+
+## 🚀 Launch Sequence
 
 ```ruby
 require 'merge_machines'
@@ -23,14 +32,18 @@ edge.merge(origin).value   # => 10, the same state again is absorbed
 Nothing here talks to a network. The caller owns the transport, the replica ids
 and every clock reading.
 
-## The native extension is required
+---
+
+## 🔩 The Native Extension Is Required
 
 There is no pure-Ruby fallback and no `DISABLE_*` switch. The gem is a binding
 to the `merge-machines` crate in `ext/merge_machines_native/core`, and it needs
 Ruby 4.0 and a Rust toolchain (or a platform gem). A second implementation
 would mean two sets of convergence tests and two byte formats to keep in step.
 
-## Sizes are a fixed menu
+---
+
+## 📐 Sizes Are a Fixed Menu
 
 The crate sizes every state by a const generic, so each size is a separately
 compiled type. The extension carries these and raises `ArgumentError` for
@@ -53,7 +66,9 @@ A state with no free slot left raises `MergeMachines::Full` rather than
 growing. That is the deal a fixed size buys: a replica's memory is known at
 construction time.
 
-## Counters
+---
+
+## 🔢 Counters
 
 ```ruby
 counter = MergeMachines::GCounter.new(replicas: 8)
@@ -66,7 +81,7 @@ counter.merge(other)                 # exact union, idempotent
 
 One shared number cannot be merged: two replicas that both saw 5 and both added
 1 have no way to tell 6 from 7. One count per replica can, because no replica
-ever writes another's count — which is why `increment` needs a `replica:`.
+ever writes another's count, which is why `increment` needs a `replica:`.
 
 `PNCounter` is two of those, one for what went up and one for what came down,
 so its value may be negative.
@@ -80,7 +95,9 @@ counter.added     # => 10
 counter.removed   # => 4
 ```
 
-## Sets
+---
+
+## 🗂️ Sets
 
 Keys are strings and must be UTF-8. The crate's elements are `Copy + Eq`, so a
 key crosses as a 64-bit hash of its bytes and the extension keeps the string
@@ -112,7 +129,9 @@ set.include?('user-1')   # => true
 `capacity:` bounds the adds and the tombstones separately. A removed key keeps
 its add slot, so a set that churns runs out.
 
-## One value, last writer wins
+---
+
+## 🏁 One Value, Last Writer Wins
 
 Stamps order the writes and the replica id breaks the ties. Both sides of a
 concurrent write pick the same winner, which is the whole point, and the
@@ -131,7 +150,9 @@ A register nobody has written holds `nil`. `stamp:` is whichever clock you
 picked at construction: an Integer for `:logical`, a `Timestamp` for
 `:hybrid`.
 
-## Which clock
+---
+
+## 🕰️ Which Chronometer
 
 `LogicalClock` is Lamport's counter. It advances on every local event and jumps
 past any stamp it is shown, so a receive is always stamped after the send it
@@ -163,7 +184,7 @@ It raises `MergeMachines::Exhausted` too, when the reading has not advanced and
 the counter that separates two events at one reading has nothing left. A
 reading that really did advance resets that counter.
 
-### The reading it wants is not a monotonic one
+### ⚠️ The Reading It Wants Is Not a Monotonic One
 
 `wall_ns:` is physical time two machines can compare, in nanoseconds, and
 defaults to
@@ -173,13 +194,16 @@ counter exists.
 
 **No deadline, timeout or budget may be derived from it.** Measuring how long
 something took belongs to the monotonic clock, which this gem neither reads nor
-models. `deadline_machines` owns that.
+models. `deadline_machines` owns that, and **AMS Layland** is the ship you hail
+for it.
 
 A reading crosses this boundary as seconds in a Float, so a realtime reading
 round-trips to about 256 nanoseconds. Two timestamps that land inside the same
 window are separated by the counter, which is what it is for.
 
-## Putting state on a wire
+---
+
+## 📦 Putting State on a Wire
 
 `dump` returns a binary string and `load` reads one back.
 
@@ -200,7 +224,9 @@ MergeMachines::GSet.load(MergeMachines::OrSet.new(capacity: 64).dump)
 # ArgumentError: codec: wrong structure tag
 ```
 
-## What this gem is not
+---
+
+## 🚫 Rules of Engagement
 
 - It is not a transport. There is no gossip, no anti-entropy loop, no peer
   list. You ship the blobs.
@@ -208,6 +234,18 @@ MergeMachines::GSet.load(MergeMachines::OrSet.new(capacity: 64).dump)
   one, and nothing here measures elapsed time.
 - It is not a state machine, and it does not retry, back off, break a circuit
   or shed load. Other machines in this family do those.
+
+---
+
+## 📡 Credits
+
+**AMS Lamport**, NCC-1178, *Lamport*-class tender.
+
+Named for Leslie Lamport's *Time, Clocks, and the Ordering of Events in a
+Distributed System* (1978), which showed that order between separated machines
+is something you stamp, not something you read off a clock.
+
+---
 
 ## License
 

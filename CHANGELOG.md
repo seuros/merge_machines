@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/seuros/merge_machines/compare/merge_machines/v0.2.0...merge_machines/v0.2.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* a republished platform gem is skipped, not fatal ([e594c48](https://github.com/seuros/merge_machines/commit/e594c484873b7e55f27ec56740d5d095ca5935f2))
+* enable the rb-sys compiled fallback so new Rubies can build ([44b08c2](https://github.com/seuros/merge_machines/commit/44b08c2a89ce9b59b16b49101dcc2dcbb5af5d6c))
+
 ## [0.2.0](https://github.com/seuros/merge_machines/compare/merge_machines-v0.1.0...merge_machines/v0.2.0) (2026-11-01)
 
 

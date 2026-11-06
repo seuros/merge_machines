@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/seuros/merge_machines/compare/merge-machines-v0.2.0...merge-machines-v0.2.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* keep test modules out of the packaged crate ([78e7eed](https://github.com/seuros/merge_machines/commit/78e7eed91d3083ffefd46200879d4186cee78b59))
+
 ## [0.2.0](https://github.com/seuros/merge_machines/compare/merge-machines-v0.1.0...merge-machines-v0.2.0) (2026-11-01)
 
 

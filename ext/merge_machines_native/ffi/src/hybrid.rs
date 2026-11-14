@@ -1,110 +1,104 @@
 //! `MergeMachines::HybridClock`: timestamps near physical time that still
-//! order.
+//! order. The caller passes every wall-clock reading; the binding reads none.
 
 use std::cell::RefCell;
 
-use bytes::Bytes;
-use magnus::scan_args::{get_kwargs, scan_args};
-use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
-use merge_machines::{HybridClock, ReplicaId};
+use magnus::typed_data::Obj;
+use magnus::{Error, IntoValue, RModule, RString, Ruby, Value, function, method, prelude::*};
+use merge_machines::{HybridClock, HybridTimestamp, Refusal};
 
-use crate::data::{stamped, timestamp};
-use crate::{
-    Whole, codec_error, exhausted, optional_kwarg, required_kwarg, trailing_replica, wall,
-};
+use crate::data::{self, classes, timestamp_from};
+use crate::{Whole, on_copy, refusal, refused_frame};
 
-/// A clock and the replica whose events it stamps, which the core does not
-/// hold.
 #[magnus::wrap(class = "MergeMachines::HybridClock", free_immediately, size)]
-struct Wrapper {
-    clock: RefCell<HybridClock>,
-    replica: ReplicaId,
+struct Wrapper(RefCell<HybridClock>);
+
+/// The `Timestamp` issued, or the refusal's symbol. `classes` was looked up
+/// before the core was called, and the clock is a copy [`on_copy`] keeps only
+/// once the value is built.
+fn stamped(
+    ruby: &Ruby,
+    classes: data::Classes,
+    outcome: Result<HybridTimestamp, Refusal>,
+) -> Result<Value, Error> {
+    match outcome {
+        Ok(stamp) => data::timestamp(classes, stamp),
+        Err(refused) => Ok(refusal(ruby, refused).into_value_with(ruby)),
+    }
 }
 
 impl Wrapper {
-    fn new(args: &[Value]) -> Result<Self, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
-        Ok(Self {
-            clock: RefCell::new(HybridClock::new()),
-            replica,
-        })
+    const fn new() -> Self {
+        Self(RefCell::new(HybridClock::new()))
     }
 
-    /// Reads a blob written by [`dump`](Self::dump).
-    fn load(ruby: &Ruby, blob: Bytes) -> Result<Self, Error> {
-        let mut clock = HybridClock::new();
-        clock
-            .decode_into(&blob)
-            .map_err(|error| codec_error(ruby, error))?;
-
-        Ok(Self {
-            clock: RefCell::new(clock),
-            replica: trailing_replica(ruby, &blob, HybridClock::ENCODED_LEN)?,
-        })
-    }
-
-    const fn replica(&self) -> ReplicaId {
-        self.replica
+    /// `HybridClock::decode`.
+    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
+        let frame = frame.to_bytes();
+        HybridClock::decode(&frame)
+            .map(|clock| Self(RefCell::new(clock)))
+            .map_err(|refused| refused_frame(ruby, refused))
     }
 
     /// The last timestamp this clock issued.
-    fn now(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
-        timestamp(ruby, rb_self.clock.borrow().last())
+    fn last(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        data::timestamp(classes(ruby)?, rb_self.0.borrow().last())
     }
 
-    /// Stamps a local event at `wall_ns:`, defaulting to the realtime clock.
-    fn tick(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let wall_ns = match optional_kwarg::<Whole<u64>>(args.keywords, "wall_ns")? {
-            Some(Whole(nanoseconds)) => nanoseconds,
-            None => wall::now_ns(ruby)?,
-        };
-        let issued = rb_self.clock.borrow_mut().tick(wall_ns);
-        timestamp(ruby, exhausted(ruby, issued)?)
+    /// Stamps a local event at `wall_ns`: the `Timestamp` issued, or
+    /// `:exhausted`.
+    fn tick(ruby: &Ruby, rb_self: Obj<Self>, Whole(wall_ns): Whole<u64>) -> Result<Value, Error> {
+        rb_self.check_frozen()?;
+        let classes = classes(ruby)?;
+        on_copy(ruby, rb_self, &rb_self.0, |clock| {
+            stamped(ruby, classes, clock.tick(wall_ns))
+        })
     }
 
-    /// Stamps the receipt of the timestamp `wall_ns:` and `counter:` name, at
-    /// the realtime clock's reading.
-    fn observe(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let (Whole(wall_ns), Whole(counter)) = get_kwargs::<_, (Whole<u64>, Whole<u64>), (), ()>(
-            args.keywords,
-            &["wall_ns", "counter"],
-            &[],
-        )?
-        .required;
-        let now = wall::now_ns(ruby)?;
-        let observed = stamped(wall_ns, counter);
-        let issued = rb_self.clock.borrow_mut().observe(now, observed);
-        timestamp(ruby, exhausted(ruby, issued)?)
+    /// Stamps the receipt of `observed` at `wall_ns`: the `Timestamp` issued,
+    /// or `:exhausted`.
+    fn observe(
+        ruby: &Ruby,
+        rb_self: Obj<Self>,
+        Whole(wall_ns): Whole<u64>,
+        observed: Value,
+    ) -> Result<Value, Error> {
+        rb_self.check_frozen()?;
+        let classes = classes(ruby)?;
+        let observed = timestamp_from(ruby, observed)?;
+        on_copy(ruby, rb_self, &rb_self.0, |clock| {
+            stamped(ruby, classes, clock.observe(wall_ns, observed))
+        })
     }
 
-    /// The core frame followed by the replica id, 64-bit little-endian.
-    fn dump(ruby: &Ruby, rb_self: &Self) -> RString {
-        let mut blob = Vec::from(rb_self.clock.borrow().encoded());
-        blob.extend_from_slice(&rb_self.replica.to_le_bytes());
-        ruby.str_from_slice(&blob)
+    fn eq(&self, other: Value) -> bool {
+        <&Self>::try_convert(other).is_ok_and(|other| *self.0.borrow() == *other.0.borrow())
+    }
+
+    /// `HybridClock::encoded`.
+    fn encoded(ruby: &Ruby, rb_self: &Self) -> RString {
+        ruby.str_from_slice(&rb_self.0.borrow().encoded())
     }
 
     fn inspect(&self) -> String {
-        let last = self.clock.borrow().last();
+        let last = self.0.borrow().last();
         format!(
-            "#<MergeMachines::HybridClock replica={} wall_ns={} counter={}>",
-            self.replica, last.wall_ns, last.counter
+            "#<MergeMachines::HybridClock wall_ns={} counter={}>",
+            last.wall_ns, last.counter
         )
     }
 }
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("HybridClock", ruby.class_object())?;
-    class.define_singleton_method("new", function!(Wrapper::new, -1))?;
-    class.define_singleton_method("load", function!(Wrapper::load, 1))?;
-    class.define_method("replica", method!(Wrapper::replica, 0))?;
-    class.define_method("now", method!(Wrapper::now, 0))?;
-    class.define_method("tick", method!(Wrapper::tick, -1))?;
-    class.define_method("observe", method!(Wrapper::observe, -1))?;
-    class.define_method("dump", method!(Wrapper::dump, 0))?;
+    class.undef_default_alloc_func();
+    class.define_singleton_method("new", function!(Wrapper::new, 0))?;
+    class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;
+    class.define_method("last", method!(Wrapper::last, 0))?;
+    class.define_method("tick", method!(Wrapper::tick, 1))?;
+    class.define_method("observe", method!(Wrapper::observe, 2))?;
+    class.define_method("==", method!(Wrapper::eq, 1))?;
+    class.define_method("encoded", method!(Wrapper::encoded, 0))?;
     class.define_method("inspect", method!(Wrapper::inspect, 0))?;
     Ok(())
 }

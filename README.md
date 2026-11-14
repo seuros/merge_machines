@@ -19,115 +19,125 @@ contact.
 ```ruby
 require 'merge_machines'
 
-edge = MergeMachines::GCounter.new(replicas: 8)
-origin = MergeMachines::GCounter.new(replicas: 8)
+edge = MergeMachines::GCounter.new(8)
+origin = MergeMachines::GCounter.new(8)
 
-edge.increment(replica: 1, by: 3)
-origin.increment(replica: 2, by: 7)
+edge.increment(1, 3)     # => :incremented
+origin.increment(2, 7)   # => :incremented
 
-edge.merge(origin).value   # => 10
-edge.merge(origin).value   # => 10, the same state again is absorbed
+edge.merge(origin)       # => :merged
+edge.value               # => 10
+edge.merge(origin)       # => :merged, the same state again is absorbed
+edge.value               # => 10
 ```
 
-Nothing here talks to a network. The caller owns the transport, the replica ids
-and every clock reading.
+Nothing here talks to a network and nothing here reads a clock. The caller owns
+the transport, the replica ids, the tags and every clock reading.
 
 ---
 
 ## 🔩 The Native Extension Is Required
 
-There is no pure-Ruby fallback and no `DISABLE_*` switch. The gem is a binding
-to the `merge-machines` crate in `ext/merge_machines_native/core`, and it needs
-Ruby 4.0 and a Rust toolchain (or a platform gem). A second implementation
-would mean two sets of convergence tests and two byte formats to keep in step.
+There is no pure-Ruby fallback and no `DISABLE_*` switch. The gem is a thin
+binding to the `merge-machines` crate in `ext/merge_machines_native/core`, and
+it needs Ruby 4.0 and a Rust toolchain (or a platform gem). Every class and
+method is named after the crate's; every value is what the crate holds:
+elements, values, replica ids, tags and stamps are unsigned 64-bit Integers. A
+non-Integer raises `TypeError`, an Integer outside `0..2**64-1` raises
+`RangeError`. Want strings in a set? Hash them yourself, and keep your own
+table if you need them back.
 
 ---
 
 ## 📐 Sizes Are a Fixed Menu
 
 The crate sizes every state by a const generic, so each size is a separately
-compiled type. The extension carries these and raises `ArgumentError` for
-anything else:
+compiled type. The extension carries these and raises `RangeError` for anything
+else:
 
-| Class         | Keyword     | Values           |
-| ------------- | ----------- | ---------------- |
-| `GCounter`    | `replicas:` | 4, 8, 16, 32     |
-| `PNCounter`   | `replicas:` | 4, 8, 16, 32     |
-| `GSet`        | `capacity:` | 64, 256, 1024    |
-| `OrSet`       | `capacity:` | 64, 256, 1024    |
-| `LwwRegister` | `stamp:`    | `:logical`, `:hybrid` |
+| Class       | Argument   | Values        |
+| ----------- | ---------- | ------------- |
+| `GCounter`  | `replicas` | 4, 8, 16, 32  |
+| `PNCounter` | `replicas` | 4, 8, 16, 32  |
+| `GSet`      | `capacity` | 64, 256, 1024 |
+| `OrSet`     | `capacity` | 64, 256, 1024 |
 
 ```ruby
-MergeMachines::GSet.new(capacity: 100)
-# ArgumentError: capacity 100 is not supported, expected one of [64, 256, 1024]
+MergeMachines::GSet.new(100)
+# RangeError: capacity 100 is not supported, expected one of [64, 256, 1024]
 ```
 
-A state with no free slot left raises `MergeMachines::Full` rather than
-growing. That is the deal a fixed size buys: a replica's memory is known at
-construction time.
+A state with no free slot left answers `:full` rather than growing. That is
+the deal a fixed size buys: a replica's memory is known at construction time.
+Two states of different sizes are different types: merging them is a
+`TypeError`.
 
 ---
 
 ## 🔢 Counters
 
 ```ruby
-counter = MergeMachines::GCounter.new(replicas: 8)
-counter.increment(replica: 1, by: 3)
-counter.increment(replica: 1)        # by: defaults to 1
-counter.count(replica: 1)            # => 4
-counter.value                        # => 4, every replica's count
-counter.merge(other)                 # exact union, idempotent
+counter = MergeMachines::GCounter.new(8)
+counter.increment(1, 3)   # => :incremented
+counter.count(1)          # => 3
+counter.value             # => 3, every replica's count
+counter.entries           # => [#<data MergeMachines::Entry replica=1, count=3>]
+counter.merge(other)      # => :merged, or :full and nothing moved
 ```
 
 One shared number cannot be merged: two replicas that both saw 5 and both added
 1 have no way to tell 6 from 7. One count per replica can, because no replica
-ever writes another's count, which is why `increment` needs a `replica:`.
+ever writes another's count, which is why `increment` needs a replica. A count
+that would pass `2**64 - 1` is `:overflow`; adding zero is honoured and claims
+no slot.
 
 `PNCounter` is two of those, one for what went up and one for what came down,
 so its value may be negative.
 
 ```ruby
-counter = MergeMachines::PNCounter.new(replicas: 8)
-counter.increment(replica: 1, by: 10)
-counter.decrement(replica: 2, by: 4)
-counter.value     # => 6
-counter.added     # => 10
-counter.removed   # => 4
+counter = MergeMachines::PNCounter.new(8)
+counter.increment(1, 10)   # => :incremented
+counter.decrement(2, 4)    # => :decremented
+counter.value              # => 6
+counter.added              # => 10
+counter.removed            # => 4
 ```
 
 ---
 
 ## 🗂️ Sets
 
-Keys are strings and must be UTF-8. The crate's elements are `Copy + Eq`, so a
-key crosses as a 64-bit hash of its bytes and the extension keeps the string
-each hash came from; `dump` carries that table along, so `load` hands the real
-strings back.
-
 ```ruby
-set = MergeMachines::GSet.new(capacity: 64)
-set.add('user-1')
-set.include?('user-1')   # => true
-set.members              # => ['user-1']
-set.merge(other)         # union
+set = MergeMachines::GSet.new(64)
+set.insert(42)        # => :inserted
+set.insert(42)        # => :duplicate, nothing changed
+set.include?(42)      # => true
+set.to_a              # => [42]
+set.merge(other)      # => :merged, or :full and nothing moved
 ```
 
 `GSet` only grows, so merging is the union and there is nothing to resolve.
 `OrSet` tags every add and tombstones the tags a remove has seen, so a remove
-races a concurrent add and loses, and re-adding afterwards works.
+races a concurrent add and loses, and re-adding afterwards works. You pick the
+tags: the replica making the add and a counter of its own that it never reuses.
 
 ```ruby
-set = MergeMachines::OrSet.new(capacity: 64)
-set.add('user-1', replica: 1)
-set.remove('user-1')
-set.include?('user-1')   # => false
+include MergeMachines
 
-set.add('user-1', replica: 1)
-set.include?('user-1')   # => true
+set = OrSet.new(64)
+set.add(42, Tag.new(1, 1))    # => :added
+set.add(42, Tag.new(1, 1))    # => :duplicate
+set.add(7, Tag.new(1, 1))     # => :mismatch, that tag already added 42
+set.remove(42)                # => :removed
+set.remove(42)                # => :not_held
+set.add(42, Tag.new(1, 2))    # => :added, back again
+set.adds                      # => every Tagged add seen, tombstoned or not
+set.removes                   # => [#<data MergeMachines::Tag replica=1, counter=1>]
 ```
 
-`capacity:` bounds the adds and the tombstones separately. A removed key keeps
-its add slot, so a set that churns runs out.
+A tombstone lives on the add it removes, so `capacity` bounds the adds and a
+remove never needs a slot. A removed element keeps its add slot, so a set that
+churns runs out.
 
 ---
 
@@ -138,17 +148,19 @@ concurrent write pick the same winner, which is the whole point, and the
 loser's value is gone, which is the price.
 
 ```ruby
-register = MergeMachines::LwwRegister.new
-register.set('http://origin', replica: 1, stamp: 7)
-register.value      # => 'http://origin'
-register.stamp      # => 7
-register.replica    # => 1
-register.merge(other)
+register = MergeMachines::LwwRegister.new(1, 7, 1)   # value, stamp, replica
+register.set(2, 9, 1)     # => :written
+register.set(3, 8, 4)     # => :superseded, a later write is held
+register.set(2, 9, 1)     # => :duplicate
+register.set(5, 9, 1)     # => :mismatch, one stamp and replica, two values
+register.value            # => 2
+register.merge(other)     # => :merged, or :mismatch and nothing moved
 ```
 
-A register nobody has written holds `nil`. `stamp:` is whichever clock you
-picked at construction: an Integer for `:logical`, a `Timestamp` for
-`:hybrid`.
+`:superseded` is the register working, not a refusal. The stamp's class picks
+the crate's register: an Integer for a logical stamp, a
+`MergeMachines::Timestamp` for a hybrid one. A stamp or register of the other
+kind is a `TypeError`.
 
 ---
 
@@ -159,70 +171,142 @@ past any stamp it is shown, so a receive is always stamped after the send it
 answers. No clock is read.
 
 ```ruby
-clock = MergeMachines::LogicalClock.new(replica: 1)
+clock = MergeMachines::LogicalClock.new
 sent_at = clock.tick       # => 1
 clock.observe(42)          # => 43, past both the local history and the send
 clock.now                  # => 43
 ```
 
-A counter with nothing left raises `MergeMachines::Exhausted` rather than
-handing out a stamp it already gave away, and the clock stays where it was.
+A counter with nothing left answers `:exhausted` rather than handing out a stamp
+it already gave away, and the clock stays where it was.
 
 `HybridClock` pairs a wall-clock reading with a counter: close to physical
 time, still totally ordered, and still monotonic when the host's clock is
-corrected backwards.
+corrected backwards. You pass the reading; the gem reads no clock.
 
 ```ruby
-clock = MergeMachines::HybridClock.new(replica: 1)
-clock.tick                              # Timestamp, reading from the realtime clock
-clock.tick(wall_ns: 1_700_000_000_500_000_000)  # or a reading you supply
-clock.observe(wall_ns: 1_500_000_000, counter: 3) # a timestamp that arrived
-clock.now                               # the last one issued
+now = Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond)
+clock = MergeMachines::HybridClock.new
+clock.tick(now)                                          # => Timestamp
+clock.observe(now, MergeMachines::Timestamp.new(now, 3)) # a timestamp that arrived
+clock.last                                               # the last one issued
 ```
 
-It raises `MergeMachines::Exhausted` too, when the reading has not advanced and
-the counter that separates two events at one reading has nothing left. A
-reading that really did advance resets that counter.
+It answers `:exhausted` too, when the reading has not advanced and the counter
+that separates two events at one reading has nothing left. A reading that
+really did advance resets that counter.
+
+Neither clock knows a replica: a stamp is a protocol number every peer
+compares, not a handle, and which replica made it is yours to carry.
 
 ### ⚠️ The Reading It Wants Is Not a Monotonic One
 
-`wall_ns:` is physical time two machines can compare, in nanoseconds, and
-defaults to
+`wall_ns` is physical time two machines can compare, in Integer nanoseconds
+since the Unix epoch:
 `Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond)`. That clock
 **steps backwards** when the host's is corrected, which is exactly why the
-counter exists.
+counter exists. It is an event-time stamp, so it stays an Integer, never a
+span or an instant on the monotonic clock.
 
 **No deadline, timeout or budget may be derived from it.** Measuring how long
 something took belongs to the monotonic clock, which this gem neither reads nor
 models. `deadline_machines` owns that, and **AMS Layland** is the ship you hail
 for it.
 
-A reading crosses this boundary as seconds in a Float, so a realtime reading
-round-trips to about 256 nanoseconds. Two timestamps that land inside the same
-window are separated by the counter, which is what it is for.
-
 ---
 
 ## 📦 Putting State on a Wire
 
-`dump` returns a binary string and `load` reads one back.
+`encoded` returns the crate's own fixed-length frame as a binary string and
+`decode` reads one back, at the shape the frame names.
 
 ```ruby
-blob = set.dump                    # String, Encoding::BINARY
-MergeMachines::GSet.load(blob)
+frame = set.encoded                # String, Encoding::BINARY
+MergeMachines::GSet.decode(frame)
 ```
 
-A blob is the crate's own fixed-length frame, led by a tag byte naming the
-structure and a field naming the shape, followed by whatever the Ruby surface
-needs that the frame does not hold: the key table for the sets and the
-register, the replica id for the clocks. `load` raises `ArgumentError` on a
-truncated blob, on one written by another structure, and on one written at a
-shape this build does not carry.
+A frame is led by a tag byte naming the structure and a field naming the shape.
+`decode` raises `RangeError` for a frame the crate refuses, and the message
+names the refusal: `truncated`, `wrong_structure`, `wrong_shape`, or
+`malformed` for a frame no sequence of calls produces (more records than slots,
+a replica, element or tag held twice, a zero count, a tombstone for an add the
+frame does not hold). A frame at a shape this build does not carry is a
+`RangeError` too.
 
 ```ruby
-MergeMachines::GSet.load(MergeMachines::OrSet.new(capacity: 64).dump)
-# ArgumentError: codec: wrong structure tag
+MergeMachines::GSet.decode(MergeMachines::OrSet.new(64).encoded)
+# RangeError: the frame is refused: wrong_structure
 ```
+
+---
+
+## 📜 The Contract
+
+- **A refusal is a symbol and changes nothing.** Never an exception. A merge is
+  checked whole before anything moves, so it lands completely or not at all.
+- **A repeat is honoured by name and changes nothing:** `:duplicate` from
+  `GSet#insert`, `OrSet#add` and `LwwRegister#set`, `:not_held` from
+  `OrSet#remove`, `:merged` for a state already seen. A repeat with a different
+  payload is `:mismatch`.
+- **Malformed input raises:** `TypeError` for the wrong class, `RangeError` for
+  an Integer out of range, an unsupported size, or a frame `decode` refuses.
+  `ArgumentError` only for the wrong number of arguments.
+- **Values are checked at construction.** `Timestamp`, `Entry`, `Tag` and
+  `Tagged` go through the crate's constructors whether you build them or the
+  gem does. They are frozen, sealed `Data`: subclassing one raises `TypeError`
+  and `allocate` is undefined. Sealing stops accidents, not reflection (a named
+  subclass's constant is bound before the raise, `Marshal.load` skips
+  `initialize`), so the binding is the authority: every value it reads must be
+  an instance of exactly its class and is checked again, raising `TypeError` or
+  `RangeError` before the crate sees it.
+- **A frozen state refuses to change.** Every mutating method raises
+  `FrozenError` on a frozen receiver, before anything moves.
+- **The binding never loses work.** Every argument is read before the crate is
+  called. `HybridClock#tick` and `#observe` stamp a copy of the clock and keep
+  it only once the `Timestamp` is built: a build that raises leaves the clock
+  unmoved, one that freezes the clock raises `FrozenError`, and one that changes
+  the clock meanwhile (a redefined `Timestamp.new` calling back in) raises
+  `RuntimeError`; in each case the outer stamp is not applied.
+- **No scopes, no restarts to resume.** Nothing here issues handles. Replica ids
+  and tags are yours; clock stamps are protocol numbers. `encoded`/`decode` is
+  the whole of persistence.
+- **No answer records a monotonic clock**, because none is taken. The hybrid
+  clock folds your `wall_ns` into the stamp it issues; a refused stamp folds
+  nothing.
+
+### Every answer
+
+| Call | Honoured | Refusals |
+| --- | --- | --- |
+| `GCounter#increment(replica, by)` | `:incremented` | `:full`, `:overflow` |
+| `GCounter#merge(other)` | `:merged` | `:full` |
+| `PNCounter#increment(replica, by)` | `:incremented` | `:full`, `:overflow` |
+| `PNCounter#decrement(replica, by)` | `:decremented` | `:full`, `:overflow` |
+| `PNCounter#merge(other)` | `:merged` | `:full` |
+| `GSet#insert(element)` | `:inserted`, `:duplicate` (*repeat*) | `:full` |
+| `GSet#merge(other)` | `:merged` | `:full` |
+| `OrSet#add(element, tag)` | `:added`, `:duplicate` (*repeat*) | `:full`, `:mismatch` |
+| `OrSet#remove(element)` | `:removed`, `:not_held` (*repeat*) | none |
+| `OrSet#merge(other)` | `:merged` | `:full`, `:mismatch` |
+| `LwwRegister#set(value, stamp, replica)` | `:written`, `:superseded`, `:duplicate` (*repeat*) | `:mismatch` |
+| `LwwRegister#merge(other)` | `:merged` | `:mismatch` |
+| `LogicalClock#tick` | the stamp issued (Integer) | `:exhausted` |
+| `LogicalClock#observe(observed)` | the stamp issued (Integer) | `:exhausted` |
+| `HybridClock#tick(wall_ns)` | the `Timestamp` issued | `:exhausted` |
+| `HybridClock#observe(wall_ns, observed)` | the `Timestamp` issued | `:exhausted` |
+| `.decode(frame)` on every class | a new state | raises `RangeError` |
+
+Which answers record the clock: none takes a monotonic `now`. Only
+`HybridClock#tick` and `#observe` take a reading, and their honoured answer is
+the stamp built from it; `:exhausted` records nothing.
+
+| Refusal | Meaning |
+| --- | --- |
+| `:full` | The call needs a slot and the fixed size has none left. |
+| `:overflow` | A replica's count would pass `2**64 - 1`. |
+| `:exhausted` | A clock has issued the last stamp its counter can hold. |
+| `:mismatch` | One tag, or one stamp and replica, already names another value. |
+| `:truncated`, `:wrong_structure`, `:wrong_shape`, `:malformed` | Only in a `decode` `RangeError` message: the frame is short, holds another structure, was written at another shape, or describes a state no calls produce. |
 
 ---
 
@@ -230,8 +314,8 @@ MergeMachines::GSet.load(MergeMachines::OrSet.new(capacity: 64).dump)
 
 - It is not a transport. There is no gossip, no anti-entropy loop, no peer
   list. You ship the blobs.
-- It is not a timer. The hybrid clock reads a wall clock, never a monotonic
-  one, and nothing here measures elapsed time.
+- It is not a timer. The hybrid clock takes a wall-clock reading you pass,
+  never a monotonic one, and nothing here measures elapsed time.
 - It is not a state machine, and it does not retry, back off, break a circuit
   or shed load. Other machines in this family do those.
 

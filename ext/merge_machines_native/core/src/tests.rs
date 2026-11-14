@@ -1,7 +1,11 @@
 use crate::{
-    GCounter, GSet, HybridTimestamp, LwwRegister, Merge, OrSet, PNCounter, Tag, same_elements,
+    Adding, GCounter, GSet, HybridTimestamp, Inserting, LwwRegister, Merge, OrSet, PNCounter,
+    Removing, Tag, same_elements,
 };
 use core::fmt::Debug;
+
+mod frames;
+mod model;
 
 fn merged<C: Merge + Clone>(left: &C, right: &C) -> C {
     let mut out = left.clone();
@@ -85,13 +89,13 @@ fn gset_merge_obeys_the_laws() {
     let mut middle = GSet::<u8, 16>::new();
     let mut right = GSet::<u8, 16>::new();
     for element in [1, 2, 3] {
-        assert_eq!(left.insert(element), Ok(()));
+        assert_eq!(left.insert(element), Ok(Inserting::Inserted));
     }
     for element in [3, 4] {
-        assert_eq!(middle.insert(element), Ok(()));
+        assert_eq!(middle.insert(element), Ok(Inserting::Inserted));
     }
     for element in [5, 1] {
-        assert_eq!(right.insert(element), Ok(()));
+        assert_eq!(right.insert(element), Ok(Inserting::Inserted));
     }
 
     assert_algebra(&left, &middle, &right);
@@ -100,20 +104,20 @@ fn gset_merge_obeys_the_laws() {
 #[test]
 fn orset_merge_obeys_the_laws() {
     let mut shared = OrSet::<u8, 16>::new();
-    assert_eq!(shared.add(1, Tag::new(1, 1)), Ok(()));
-    assert_eq!(shared.add(2, Tag::new(1, 2)), Ok(()));
+    assert_eq!(shared.add(1, Tag::new(1, 1)), Ok(Adding::Added));
+    assert_eq!(shared.add(2, Tag::new(1, 2)), Ok(Adding::Added));
 
     let mut left = shared;
-    assert_eq!(left.remove(&1), Ok(()));
-    assert_eq!(left.add(3, Tag::new(1, 3)), Ok(()));
+    assert_eq!(left.remove(&1), Removing::Removed);
+    assert_eq!(left.add(3, Tag::new(1, 3)), Ok(Adding::Added));
 
     let mut middle = shared;
-    assert_eq!(middle.add(1, Tag::new(2, 1)), Ok(()));
-    assert_eq!(middle.remove(&2), Ok(()));
+    assert_eq!(middle.add(1, Tag::new(2, 1)), Ok(Adding::Added));
+    assert_eq!(middle.remove(&2), Removing::Removed);
 
     let mut right = shared;
-    assert_eq!(right.add(4, Tag::new(3, 1)), Ok(()));
-    assert_eq!(right.remove(&4), Ok(()));
+    assert_eq!(right.add(4, Tag::new(3, 1)), Ok(Adding::Added));
+    assert_eq!(right.remove(&4), Removing::Removed);
 
     assert_algebra(&left, &middle, &right);
 }
@@ -121,14 +125,14 @@ fn orset_merge_obeys_the_laws() {
 #[test]
 fn orset_converges_on_the_same_members_whatever_the_merge_order() {
     let mut shared = OrSet::<u8, 16>::new();
-    assert_eq!(shared.add(1, Tag::new(1, 1)), Ok(()));
+    assert_eq!(shared.add(1, Tag::new(1, 1)), Ok(Adding::Added));
 
     let mut remover = shared;
-    assert_eq!(remover.remove(&1), Ok(()));
+    assert_eq!(remover.remove(&1), Removing::Removed);
     let mut adder = shared;
-    assert_eq!(adder.add(1, Tag::new(2, 1)), Ok(()));
+    assert_eq!(adder.add(1, Tag::new(2, 1)), Ok(Adding::Added));
     let mut bystander = shared;
-    assert_eq!(bystander.add(2, Tag::new(3, 1)), Ok(()));
+    assert_eq!(bystander.add(2, Tag::new(3, 1)), Ok(Adding::Added));
 
     let one = merged(&merged(&remover, &adder), &bystander);
     let two = merged(&merged(&bystander, &remover), &adder);

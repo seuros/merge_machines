@@ -1,4 +1,4 @@
-use crate::{CodecError, Merge, PNCounter};
+use crate::{Merge, PNCounter, Refusal};
 
 #[test]
 fn the_value_is_what_was_added_minus_what_was_taken() {
@@ -55,20 +55,6 @@ fn a_decrement_the_other_side_has_not_seen_is_not_lost() {
 const FRAME_LEN: usize = PNCounter::<4>::ENCODED_LEN;
 
 #[test]
-fn a_frame_round_trips_what_went_up_and_what_came_down() {
-    let mut counter = PNCounter::<4>::new();
-    assert_eq!(counter.increment(1, 10), Ok(()));
-    assert_eq!(counter.decrement(2, 4), Ok(()));
-
-    let mut frame = [0_u8; FRAME_LEN];
-    assert_eq!(counter.encode(&mut frame), Ok(FRAME_LEN));
-
-    let restored = PNCounter::<4>::decode(&frame);
-    assert_eq!(restored, Ok(counter));
-    assert_eq!(restored.map(|counter| counter.value()), Ok(6));
-}
-
-#[test]
 fn a_balance_is_not_clamped_by_the_total_of_either_side() {
     let mut counter = PNCounter::<4>::new();
     assert_eq!(counter.increment(1, u64::MAX), Ok(()));
@@ -89,60 +75,28 @@ fn a_balance_is_not_clamped_by_the_total_of_either_side() {
 }
 
 #[test]
-fn encoding_into_a_short_buffer_is_refused() {
-    let mut frame = [0_u8; FRAME_LEN - 1];
+fn a_refused_merge_moves_neither_side() {
+    let mut left = PNCounter::<1>::new();
+    assert_eq!(left.decrement(1, 1), Ok(()));
+    let mut right = PNCounter::<1>::new();
+    assert_eq!(right.increment(2, 5), Ok(()));
+    assert_eq!(right.decrement(2, 5), Ok(()));
 
-    assert_eq!(
-        PNCounter::<4>::new().encode(&mut frame),
-        Err(CodecError::Truncated)
-    );
+    let before = left;
+    assert_eq!(left.merge(&right), Err(Refusal::Full));
+    assert_eq!(left, before);
+    assert_eq!(left.added(), 0, "the side with room must not take its half");
 }
 
 #[test]
-fn a_short_frame_is_refused() {
-    assert_eq!(PNCounter::<4>::decode(&[]), Err(CodecError::Truncated));
-}
-
-#[test]
-fn another_structures_frame_is_refused() {
-    let mut frame = [0_u8; FRAME_LEN];
-    assert_eq!(PNCounter::<4>::new().encode(&mut frame), Ok(FRAME_LEN));
-    frame[crate::TAG] = crate::TAG_GCOUNTER;
-
-    assert_eq!(PNCounter::<4>::decode(&frame), Err(CodecError::Tag));
-}
-
-#[test]
-fn a_frame_written_at_another_replica_count_is_refused() {
-    let mut frame = [0_u8; PNCounter::<8>::ENCODED_LEN];
-    assert_eq!(
-        PNCounter::<8>::new().encode(&mut frame),
-        Ok(PNCounter::<8>::ENCODED_LEN)
-    );
-
-    assert_eq!(PNCounter::<4>::decode(&frame), Err(CodecError::Parameters));
-}
-
-#[test]
-fn a_refused_frame_leaves_the_counter_alone() {
-    let mut counter = PNCounter::<4>::new();
-    assert_eq!(counter.decrement(1, 5), Ok(()));
+fn a_refused_step_changes_nothing() {
+    let mut counter = PNCounter::<1>::new();
+    assert_eq!(counter.increment(1, u64::MAX), Ok(()));
     let before = counter;
 
-    assert_eq!(counter.decode_into(&[]), Err(CodecError::Truncated));
-
+    assert_eq!(counter.increment(1, 1), Err(Refusal::Overflow));
+    assert_eq!(counter.increment(2, 1), Err(Refusal::Full));
     assert_eq!(counter, before);
-}
-
-#[cfg(feature = "alloc")]
-#[test]
-fn the_allocated_frame_is_the_frame() {
-    let mut counter = PNCounter::<4>::new();
-    assert_eq!(counter.increment(3, 9), Ok(()));
-    assert_eq!(counter.decrement(4, 1), Ok(()));
-
-    let mut frame = [0_u8; FRAME_LEN];
-    assert_eq!(counter.encode(&mut frame), Ok(FRAME_LEN));
-
-    assert_eq!(*counter.encoded(), frame);
+    assert_eq!(counter.decrement(1, 1), Ok(()));
+    assert_eq!(counter.decrement(2, 1), Err(Refusal::Full));
 }

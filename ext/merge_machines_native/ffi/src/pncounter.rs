@@ -1,23 +1,18 @@
-//! `MergeMachines::PNCounter`: a counter replicas can lower as well as raise.
+//! `MergeMachines::PNCounter`: a counter that goes both ways.
 
 use std::cell::RefCell;
 
-use bytes::Bytes;
-use magnus::scan_args::scan_args;
 use magnus::typed_data::Obj;
-use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
-use merge_machines::PNCounter;
+use magnus::{Error, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
+use merge_machines::{PNCounter, ReplicaId};
 
-use crate::gcounter::increment_args;
 use crate::shape::shaped;
-use crate::{
-    REPLICAS, Whole, blob_shape, capacity, mismatch, required_kwarg, unsupported, unsupported_blob,
-};
+use crate::{Whole, expected, merged, unit};
 
 /// The counter at a single replica count.
 type Held<const R: usize> = PNCounter<R>;
 
-shaped!(Counter over Held { R4 = 4, R8 = 8, R16 = 16, R32 = 32 });
+shaped!(Counter over Held as "replicas" { R4 = 4, R8 = 8, R16 = 16, R32 = 32 });
 
 /// Runs `body` against whichever variant is held.
 macro_rules! counter {
@@ -39,70 +34,77 @@ const fn replicas_of<const R: usize>(_: &Held<R>) -> usize {
 }
 
 impl Wrapper {
-    fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let Whole(replicas): Whole<usize> = required_kwarg(args.keywords, "replicas")?;
-        Ok(Self(RefCell::new(dispatch(ruby, replicas, None)?)))
+    /// `PNCounter::<replicas>::new()`.
+    fn new(ruby: &Ruby, Whole(replicas): Whole<usize>) -> Result<Self, Error> {
+        Counter::blank(ruby, replicas).map(|held| Self(RefCell::new(held)))
     }
 
-    /// Reads a blob written by [`dump`](Self::dump).
-    fn load(ruby: &Ruby, blob: Bytes) -> Result<Self, Error> {
-        let replicas = blob_shape(ruby, &blob)?;
-        Ok(Self(RefCell::new(dispatch(ruby, replicas, Some(&blob))?)))
+    /// `PNCounter::decode`, at the replica count the frame names.
+    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
+        let frame = frame.to_bytes();
+        Counter::decoded(ruby, &frame).map(|held| Self(RefCell::new(held)))
     }
 
     fn replicas(&self) -> usize {
         counter!(&*self.0.borrow(), |counter| replicas_of(&**counter))
     }
 
-    /// Adds `by:` to `replica:`'s own count.
-    fn increment(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<(), Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let (replica, by) = increment_args(args.keywords)?;
-        capacity(
-            ruby,
-            counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
-                .increment(replica, by)),
-        )
+    fn increment(
+        ruby: &Ruby,
+        rb_self: Obj<Self>,
+        Whole(replica): Whole<ReplicaId>,
+        Whole(by): Whole<u64>,
+    ) -> Result<Symbol, Error> {
+        rb_self.check_frozen()?;
+        let outcome = counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
+            .increment(replica, by));
+        Ok(unit(ruby, outcome, "incremented"))
     }
 
-    /// Takes `by:` away on `replica:`'s own account.
-    fn decrement(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<(), Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let (replica, by) = increment_args(args.keywords)?;
-        capacity(
-            ruby,
-            counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
-                .decrement(replica, by)),
-        )
+    fn decrement(
+        ruby: &Ruby,
+        rb_self: Obj<Self>,
+        Whole(replica): Whole<ReplicaId>,
+        Whole(by): Whole<u64>,
+    ) -> Result<Symbol, Error> {
+        rb_self.check_frozen()?;
+        let outcome = counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
+            .decrement(replica, by));
+        Ok(unit(ruby, outcome, "decremented"))
     }
 
-    /// Everything added, minus everything taken away.
     fn value(&self) -> i128 {
         counter!(&*self.0.borrow(), |counter| counter.value())
     }
 
-    /// Everything added, by every replica.
     fn added(&self) -> u128 {
         counter!(&*self.0.borrow(), |counter| counter.added())
     }
 
-    /// Everything taken away, by every replica.
     fn removed(&self) -> u128 {
         counter!(&*self.0.borrow(), |counter| counter.removed())
     }
 
-    fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: &Self) -> Result<Obj<Self>, Error> {
-        let source = other.0.borrow().clone();
-        let Some(folded) = rb_self.0.borrow_mut().absorb(&source) else {
-            return Err(mismatch(ruby, "counter"));
-        };
-        capacity(ruby, folded)?;
-        Ok(rb_self)
+    fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
+        rb_self.check_frozen()?;
+        let source = <&Self>::try_convert(other)
+            .map(|other| other.0.borrow().clone())
+            .map_err(|_| expected(ruby, "a MergeMachines::PNCounter", other))?;
+        let outcome = rb_self.0.borrow_mut().absorb(&source);
+        merged(
+            ruby,
+            outcome,
+            other,
+            "a PNCounter of the same replica count",
+        )
     }
 
-    /// The core frame, tag 0x62.
-    fn dump(ruby: &Ruby, rb_self: &Self) -> RString {
+    fn eq(&self, other: Value) -> bool {
+        <&Self>::try_convert(other).is_ok_and(|other| self.0.borrow().same(&other.0.borrow()))
+    }
+
+    /// `PNCounter::encoded`.
+    fn encoded(ruby: &Ruby, rb_self: &Self) -> RString {
         let frame = counter!(&*rb_self.0.borrow(), |counter| counter.encoded());
         ruby.str_from_slice(&frame)
     }
@@ -116,28 +118,20 @@ impl Wrapper {
     }
 }
 
-/// The variant for `replicas`, read from `blob` when there is one.
-fn dispatch(ruby: &Ruby, replicas: usize, blob: Option<&[u8]>) -> Result<Counter, Error> {
-    let Some(frame) = blob else {
-        return Counter::blank(replicas)
-            .ok_or_else(|| unsupported(ruby, "replicas", replicas, &REPLICAS));
-    };
-    Counter::decoded(ruby, replicas, frame)
-        .unwrap_or_else(|| Err(unsupported_blob(ruby, "replica count", &REPLICAS)))
-}
-
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("PNCounter", ruby.class_object())?;
-    class.define_singleton_method("new", function!(Wrapper::new, -1))?;
-    class.define_singleton_method("load", function!(Wrapper::load, 1))?;
+    class.undef_default_alloc_func();
+    class.define_singleton_method("new", function!(Wrapper::new, 1))?;
+    class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;
     class.define_method("replicas", method!(Wrapper::replicas, 0))?;
-    class.define_method("increment", method!(Wrapper::increment, -1))?;
-    class.define_method("decrement", method!(Wrapper::decrement, -1))?;
+    class.define_method("increment", method!(Wrapper::increment, 2))?;
+    class.define_method("decrement", method!(Wrapper::decrement, 2))?;
     class.define_method("value", method!(Wrapper::value, 0))?;
     class.define_method("added", method!(Wrapper::added, 0))?;
     class.define_method("removed", method!(Wrapper::removed, 0))?;
     class.define_method("merge", method!(Wrapper::merge, 1))?;
-    class.define_method("dump", method!(Wrapper::dump, 0))?;
+    class.define_method("==", method!(Wrapper::eq, 1))?;
+    class.define_method("encoded", method!(Wrapper::encoded, 0))?;
     class.define_method("inspect", method!(Wrapper::inspect, 0))?;
     Ok(())
 }

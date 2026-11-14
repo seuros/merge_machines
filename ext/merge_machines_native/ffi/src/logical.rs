@@ -2,88 +2,83 @@
 
 use std::cell::RefCell;
 
-use bytes::Bytes;
-use magnus::scan_args::scan_args;
-use magnus::{Error, RHash, RModule, RString, Ruby, Value, function, method, prelude::*};
-use merge_machines::{LogicalClock, ReplicaId};
+use magnus::typed_data::Obj;
+use magnus::{Error, IntoValue, RModule, RString, Ruby, Value, function, method, prelude::*};
+use merge_machines::{LogicalClock, Refusal};
 
-use crate::{Whole, codec_error, exhausted, required_kwarg, trailing_replica};
+use crate::{Whole, refusal, refused_frame};
 
-/// A clock and the replica whose events it stamps, which the core does not
-/// hold.
 #[magnus::wrap(class = "MergeMachines::LogicalClock", free_immediately, size)]
-struct Wrapper {
-    clock: RefCell<LogicalClock>,
-    replica: ReplicaId,
+struct Wrapper(RefCell<LogicalClock>);
+
+/// The stamp issued, or the refusal's symbol.
+fn stamped(ruby: &Ruby, outcome: Result<u64, Refusal>) -> Value {
+    match outcome {
+        Ok(stamp) => stamp.into_value_with(ruby),
+        Err(refused) => refusal(ruby, refused).into_value_with(ruby),
+    }
 }
 
 impl Wrapper {
-    fn new(args: &[Value]) -> Result<Self, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let Whole(replica): Whole<ReplicaId> = required_kwarg(args.keywords, "replica")?;
-        Ok(Self {
-            clock: RefCell::new(LogicalClock::new()),
-            replica,
-        })
+    const fn new() -> Self {
+        Self(RefCell::new(LogicalClock::new()))
     }
 
-    /// Reads a blob written by [`dump`](Self::dump).
-    fn load(ruby: &Ruby, blob: Bytes) -> Result<Self, Error> {
-        let mut clock = LogicalClock::new();
-        clock
-            .decode_into(&blob)
-            .map_err(|error| codec_error(ruby, error))?;
-
-        Ok(Self {
-            clock: RefCell::new(clock),
-            replica: trailing_replica(ruby, &blob, LogicalClock::ENCODED_LEN)?,
-        })
-    }
-
-    const fn replica(&self) -> ReplicaId {
-        self.replica
+    /// `LogicalClock::decode`.
+    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
+        let frame = frame.to_bytes();
+        LogicalClock::decode(&frame)
+            .map(|clock| Self(RefCell::new(clock)))
+            .map_err(|refused| refused_frame(ruby, refused))
     }
 
     /// The last stamp this clock issued.
     fn now(&self) -> u64 {
-        self.clock.borrow().now()
+        self.0.borrow().now()
     }
 
-    /// Stamps a local event.
-    fn tick(ruby: &Ruby, rb_self: &Self) -> Result<u64, Error> {
-        exhausted(ruby, rb_self.clock.borrow_mut().tick())
+    /// The stamp issued, or `:exhausted`.
+    fn tick(ruby: &Ruby, rb_self: Obj<Self>) -> Result<Value, Error> {
+        rb_self.check_frozen()?;
+        let outcome = rb_self.0.borrow_mut().tick();
+        Ok(stamped(ruby, outcome))
     }
 
-    /// Stamps the receipt of `observed`, a stamp from another replica.
-    fn observe(ruby: &Ruby, rb_self: &Self, Whole(observed): Whole<u64>) -> Result<u64, Error> {
-        exhausted(ruby, rb_self.clock.borrow_mut().observe(observed))
+    /// The stamp issued, or `:exhausted`.
+    fn observe(
+        ruby: &Ruby,
+        rb_self: Obj<Self>,
+        Whole(observed): Whole<u64>,
+    ) -> Result<Value, Error> {
+        rb_self.check_frozen()?;
+        let outcome = rb_self.0.borrow_mut().observe(observed);
+        Ok(stamped(ruby, outcome))
     }
 
-    /// The core frame followed by the replica id, 64-bit little-endian.
-    fn dump(ruby: &Ruby, rb_self: &Self) -> RString {
-        let mut blob = Vec::from(rb_self.clock.borrow().encoded());
-        blob.extend_from_slice(&rb_self.replica.to_le_bytes());
-        ruby.str_from_slice(&blob)
+    fn eq(&self, other: Value) -> bool {
+        <&Self>::try_convert(other).is_ok_and(|other| *self.0.borrow() == *other.0.borrow())
+    }
+
+    /// `LogicalClock::encoded`.
+    fn encoded(ruby: &Ruby, rb_self: &Self) -> RString {
+        ruby.str_from_slice(&rb_self.0.borrow().encoded())
     }
 
     fn inspect(&self) -> String {
-        format!(
-            "#<MergeMachines::LogicalClock replica={} now={}>",
-            self.replica,
-            self.now()
-        )
+        format!("#<MergeMachines::LogicalClock now={}>", self.now())
     }
 }
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("LogicalClock", ruby.class_object())?;
-    class.define_singleton_method("new", function!(Wrapper::new, -1))?;
-    class.define_singleton_method("load", function!(Wrapper::load, 1))?;
-    class.define_method("replica", method!(Wrapper::replica, 0))?;
+    class.undef_default_alloc_func();
+    class.define_singleton_method("new", function!(Wrapper::new, 0))?;
+    class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;
     class.define_method("now", method!(Wrapper::now, 0))?;
     class.define_method("tick", method!(Wrapper::tick, 0))?;
     class.define_method("observe", method!(Wrapper::observe, 1))?;
-    class.define_method("dump", method!(Wrapper::dump, 0))?;
+    class.define_method("==", method!(Wrapper::eq, 1))?;
+    class.define_method("encoded", method!(Wrapper::encoded, 0))?;
     class.define_method("inspect", method!(Wrapper::inspect, 0))?;
     Ok(())
 }

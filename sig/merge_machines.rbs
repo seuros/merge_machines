@@ -1,76 +1,97 @@
-# Conflict-free replicated data types and the clocks that stamp them. Every
-# class here is defined by the native extension, which binds the
-# `merge-machines` crate.
+# Conflict-free replicated data types and the clocks that stamp them: a thin
+# mirror of the `merge-machines` crate.
 #
 # Every state merges commutatively, associatively and idempotently, so replicas
 # converge without a coordinator and without ordering their messages. Nothing
-# here talks to a network: the caller owns the transport and the replica ids.
+# here talks to a network or reads a clock: the caller owns the transport, the
+# replica ids, the OrSet tags and every wall-clock reading.
+#
+# Elements, values, replica ids, tags and stamps are unsigned 64-bit Integers.
+# A non-Integer raises TypeError; an Integer outside 0..2**64-1 raises
+# RangeError. A refusal is a symbol, never an exception, and changes nothing.
 module MergeMachines
   VERSION: String
 
-  # Nanoseconds in a second. Wall-clock readings cross this boundary as seconds
-  # and move through the clocks as nanoseconds.
-  NS_PER_SECOND: Integer
+  type refusal = :full | :overflow | :exhausted | :mismatch
+               | :truncated | :wrong_structure | :wrong_shape | :malformed
 
-  class Error < StandardError
-  end
-
-  # Raised when a state needs a slot and every one of them is taken.
-  class Full < Error
-  end
-
-  # Raised when a clock has issued the last stamp its counter can hold, by
-  # either clock.
-  class Exhausted < Error
-  end
-
-  # A wall-clock reading in nanoseconds and the counter that breaks its ties.
+  # The core's `HybridTimestamp`. `wall_ns` is an event-time stamp in
+  # nanoseconds since the Unix epoch, not a monotonic instant.
   class Timestamp < ::Data
     attr_reader wall_ns: Integer
     attr_reader counter: Integer
+    def self.new: (Integer wall_ns, Integer counter) -> instance
+                | (wall_ns: Integer, counter: Integer) -> instance
   end
 
-  # Which clock stamps a register's writes.
-  type stamp_kind = :logical | :hybrid
+  # The core's `Entry`: one replica's count in a GCounter.
+  class Entry < ::Data
+    attr_reader replica: Integer
+    attr_reader count: Integer
+    def self.new: (Integer replica, Integer count) -> instance
+                | (replica: Integer, count: Integer) -> instance
+  end
+
+  # The core's `Tag`: which add an OrSet remove is talking about.
+  class Tag < ::Data
+    attr_reader replica: Integer
+    attr_reader counter: Integer
+    def self.new: (Integer replica, Integer counter) -> instance
+                | (replica: Integer, counter: Integer) -> instance
+  end
+
+  # The core's `Tagged`: an OrSet element and the Tag it came under. TypeError
+  # unless `tag` is a Tag.
+  class Tagged < ::Data
+    attr_reader element: Integer
+    attr_reader tag: Tag
+    def self.new: (Integer element, Tag tag) -> instance
+                | (element: Integer, tag: Tag) -> instance
+  end
 
   # A counter that only grows, counted separately by each replica.
   class GCounter
-    # `replicas` is 4, 8, 16 or 32.
-    def self.new: (replicas: Integer) -> instance
+    # `GCounter::<replicas>::new()`. RangeError unless `replicas` is 4, 8, 16
+    # or 32.
+    def self.new: (Integer replicas) -> instance
 
-    def self.load: (String blob) -> instance
+    # Reads an `encoded` frame at the replica count it names. RangeError for a
+    # frame the core refuses (the message names the refusal) or a replica
+    # count outside 4, 8, 16, 32.
+    def self.decode: (String frame) -> instance
 
     def replicas: () -> Integer
 
-    # Adds `by` to `replica`'s own count. Raises `Full` when `replica` has no
-    # slot yet and every one of them is taken.
-    def increment: (replica: Integer, ?by: Integer) -> nil
+    # Adds `by` to `replica`'s count. Zero is honoured and claims no slot.
+    def increment: (Integer replica, Integer by) -> (:incremented | :full | :overflow)
 
-    # What `replica` has added, zero if it has no slot here.
-    def count: (replica: Integer) -> Integer
+    # What `replica` has added, zero if it holds no slot here.
+    def count: (Integer replica) -> Integer
 
-    # Every replica's count.
     def value: () -> Integer
+    def entries: () -> Array[Entry]
 
-    # Folds `other` in. Raises `ArgumentError` on a different replica count.
-    def merge: (GCounter other) -> self
+    # Folds `other` in whole or not at all. TypeError for anything but a
+    # GCounter of the same replica count.
+    def merge: (GCounter other) -> (:merged | :full)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
   # A counter replicas can both raise and lower, from two that only grow.
   class PNCounter
-    # `replicas` is 4, 8, 16 or 32.
-    def self.new: (replicas: Integer) -> instance
+    # `PNCounter::<replicas>::new()`. RangeError unless `replicas` is 4, 8, 16
+    # or 32.
+    def self.new: (Integer replicas) -> instance
 
-    def self.load: (String blob) -> instance
+    # RangeError for a frame the core refuses or an unsupported replica count.
+    def self.decode: (String frame) -> instance
 
     def replicas: () -> Integer
-
-    def increment: (replica: Integer, ?by: Integer) -> nil
-
-    def decrement: (replica: Integer, ?by: Integer) -> nil
+    def increment: (Integer replica, Integer by) -> (:incremented | :full | :overflow)
+    def decrement: (Integer replica, Integer by) -> (:decremented | :full | :overflow)
 
     # Everything added, minus everything taken away, which may be negative.
     def value: () -> Integer
@@ -78,161 +99,145 @@ module MergeMachines
     def added: () -> Integer
     def removed: () -> Integer
 
-    # Folds `other` in. Raises `ArgumentError` on a different replica count.
-    def merge: (PNCounter other) -> self
+    # Folds `other` in whole or not at all. TypeError for anything but a
+    # PNCounter of the same replica count.
+    def merge: (PNCounter other) -> (:merged | :full)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
   # One value, held by whichever write was stamped last, with the replica id as
-  # the tie-break.
+  # the tie-break. Built with an Integer stamp it is the core's
+  # `LwwRegister<u64, u64>`; with a Timestamp, `LwwRegister<u64,
+  # HybridTimestamp>`. A stamp or register of the other kind is a TypeError.
   class LwwRegister
-    # `stamp` picks which clock stamps the writes, defaulting to `:logical`.
-    def self.new: (?stamp: stamp_kind) -> instance
+    def self.new: (Integer value, Integer | Timestamp stamp, Integer replica) -> instance
 
-    def self.load: (String blob) -> instance
+    # RangeError for a frame the core refuses, including one naming another
+    # kind of stamp than the two supported.
+    def self.decode: (String frame) -> instance
 
-    def stamp_kind: () -> stamp_kind
+    # `:superseded` is a write a later one beats: the register working, not a
+    # refusal. `:duplicate` is the write already held. `:mismatch` is the same
+    # stamp and replica with another value.
+    def set: (Integer value, Integer | Timestamp stamp, Integer replica)
+           -> (:written | :duplicate | :superseded | :mismatch)
 
-    # Writes `value` if `stamp` and `replica` beat the write already held.
-    # `stamp` is an Integer on a logical register and a `Timestamp` on a hybrid
-    # one. `value` must be UTF-8.
-    def set: (String value, replica: Integer, stamp: Integer | Timestamp) -> nil
-
-    # The value being held, `nil` until the first write.
-    def value: () -> String?
-
-    # The stamp of the write being held.
+    def value: () -> Integer
     def stamp: () -> (Integer | Timestamp)
-
-    # The replica that wrote what is being held.
     def replica: () -> Integer
 
-    # Folds `other` in. Raises `ArgumentError` on a register stamped by the
-    # other clock.
-    def merge: (LwwRegister other) -> self
+    # TypeError for anything but a register of the same kind of stamp.
+    def merge: (LwwRegister other) -> (:merged | :mismatch)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
-  # A set nothing is ever taken out of.
+  # A set of Integers nothing is ever taken out of.
   class GSet
-    # `capacity` is 64, 256 or 1024.
-    def self.new: (capacity: Integer) -> instance
+    # `GSet::<u64, capacity>::new()`. RangeError unless `capacity` is 64, 256
+    # or 1024.
+    def self.new: (Integer capacity) -> instance
 
-    def self.load: (String blob) -> instance
+    # RangeError for a frame the core refuses or an unsupported capacity.
+    def self.decode: (String frame) -> instance
 
     def capacity: () -> Integer
+    def insert: (Integer element) -> (:inserted | :duplicate | :full)
+    def include?: (Integer element) -> bool
 
-    # Adds `key`, which is a no-op if it is already in. Raises `Full` when
-    # `key` is new and every slot is taken, `EncodingError` when it is not
-    # UTF-8.
-    def add: (String key) -> nil
-
-    def include?: (String key) -> bool
-
-    # The keys in the set, in no particular order.
-    def members: () -> Array[String]
+    # The core's `iter`, collected, in no particular order.
+    def to_a: () -> Array[Integer]
 
     def size: () -> Integer
     def empty?: () -> bool
 
-    # Unions `other` in. Raises `ArgumentError` on a different capacity.
-    def merge: (GSet other) -> self
+    # TypeError for anything but a GSet of the same capacity.
+    def merge: (GSet other) -> (:merged | :full)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
-  # A set keys can leave, where a concurrent add survives a remove.
+  # A set of Integers elements can leave, where a concurrent add survives a
+  # remove. The caller picks every add's Tag. A tombstone lives on the add it
+  # removes, so `capacity` bounds the adds and a remove never refuses.
   class OrSet
-    # `capacity` is 64, 256 or 1024, and bounds the adds and the tombstones
-    # separately.
-    def self.new: (capacity: Integer) -> instance
+    # `OrSet::<u64, capacity>::new()`. RangeError unless `capacity` is 64, 256
+    # or 1024.
+    def self.new: (Integer capacity) -> instance
 
-    def self.load: (String blob) -> instance
+    # RangeError for a frame the core refuses or an unsupported capacity.
+    def self.decode: (String frame) -> instance
 
     def capacity: () -> Integer
 
-    # Adds `key` under a tag of `replica` and the next counter that replica has
-    # not used here. Raises `Full` when every add slot is taken, `Exhausted`
-    # when `replica` has no counter left, `EncodingError` when `key` is not
-    # UTF-8.
-    def add: (String key, replica: Integer) -> nil
+    # `:duplicate` is the same tag adding the same element again, tombstoned or
+    # not. `:mismatch` is a tag that already added another element. TypeError
+    # unless `tag` is a Tag.
+    def add: (Integer element, Tag tag) -> (:added | :duplicate | :full | :mismatch)
 
-    # Tombstones every tag this set has seen for `key`. Raises `Full` when the
-    # tombstones do not fit.
-    def remove: (String key) -> nil
+    def remove: (Integer element) -> (:removed | :not_held)
+    def include?: (Integer element) -> bool
 
-    def include?: (String key) -> bool
-
-    # The keys still in the set, each once, in no particular order.
-    def members: () -> Array[String]
+    # The core's `iter`, collected: live elements, each once.
+    def to_a: () -> Array[Integer]
 
     def size: () -> Integer
     def empty?: () -> bool
+    def adds: () -> Array[Tagged]
+    def removes: () -> Array[Tag]
 
-    # Folds `other` in. Raises `ArgumentError` on a different capacity.
-    def merge: (OrSet other) -> self
+    # TypeError for anything but an OrSet of the same capacity.
+    def merge: (OrSet other) -> (:merged | :full | :mismatch)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
-  # Lamport's counter: ordering events without reading a clock.
+  # Lamport's counter. Its stamps are protocol numbers peers compare, not
+  # handles.
   class LogicalClock
-    def self.new: (replica: Integer) -> instance
+    def self.new: () -> instance
 
-    def self.load: (String blob) -> instance
-
-    # The replica whose events this clock stamps.
-    def replica: () -> Integer
+    # RangeError for a frame the core refuses.
+    def self.decode: (String frame) -> instance
 
     # The last stamp this clock issued.
     def now: () -> Integer
 
-    # Stamps a local event. Raises `Exhausted` when the counter holds its
-    # highest value, which leaves the clock where it was.
-    def tick: () -> Integer
-
-    # Stamps the receipt of `observed`, a stamp from another replica. Raises
-    # `Exhausted` when it cannot be stamped after `observed`.
-    def observe: (Integer observed) -> Integer
-
-    def dump: () -> String
+    def tick: () -> (Integer | :exhausted)
+    def observe: (Integer observed) -> (Integer | :exhausted)
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 
-  # A wall-clock reading paired with a counter that breaks its ties, which never
-  # goes backwards.
-  #
-  # The reading comes from `Process::CLOCK_REALTIME`, which may step backwards.
-  # No deadline may be derived from it.
+  # A wall-clock reading paired with a counter, never going backwards. The
+  # caller passes every `wall_ns` (Process.clock_gettime(Process::CLOCK_REALTIME,
+  # :nanosecond)); no deadline may be derived from it.
   class HybridClock
-    def self.new: (replica: Integer) -> instance
+    def self.new: () -> instance
 
-    def self.load: (String blob) -> instance
-
-    # The replica whose events this clock stamps.
-    def replica: () -> Integer
+    # RangeError for a frame the core refuses.
+    def self.decode: (String frame) -> instance
 
     # The last timestamp this clock issued.
-    def now: () -> Timestamp
+    def last: () -> Timestamp
 
-    # Stamps a local event at `wall_ns`, defaulting to the realtime clock's
-    # reading. Raises `Exhausted` when the reading has not advanced and the
-    # counter that separates two events at one reading holds its highest value,
-    # which leaves the clock where it was.
-    def tick: (?wall_ns: Integer) -> Timestamp
+    def tick: (Integer wall_ns) -> (Timestamp | :exhausted)
 
-    # Stamps the receipt of the timestamp `wall_ns` and `counter` name, at the
-    # realtime clock's reading. Raises `Exhausted` when it cannot be stamped
-    # after the timestamp observed.
-    def observe: (wall_ns: Integer, counter: Integer) -> Timestamp
+    # TypeError unless `observed` is a Timestamp.
+    def observe: (Integer wall_ns, Timestamp observed) -> (Timestamp | :exhausted)
 
-    def dump: () -> String
+    def ==: (untyped other) -> bool
+    def encoded: () -> String
     def inspect: () -> String
   end
 end

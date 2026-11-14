@@ -1,10 +1,8 @@
 //! A counter that only goes up, held as one count per replica.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG,
-    TAG_GCOUNTER, TAG_LEN, free_slot, read_small, read_u64, small_field, tagged_frame, write_into,
+    COUNT_LEN, FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_GCOUNTER, TAG_LEN,
+    fill_free, read_small, read_u64, small_field, tagged_frame,
 };
 
 /// Bytes one slot record occupies: the replica id then its count.
@@ -29,12 +27,20 @@ const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
 const BODY: usize = SHAPE.end;
 
 /// One replica's contribution to a [`GCounter`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     /// The replica that owns this count.
     pub replica: ReplicaId,
     /// How much that replica has added.
     pub count: u64,
+}
+
+impl Entry {
+    /// `replica`'s contribution of `count`. Every pair is a valid entry.
+    #[must_use]
+    pub const fn new(replica: ReplicaId, count: u64) -> Self {
+        Self { replica, count }
+    }
 }
 
 /// A counter that only grows, counted separately by each replica.
@@ -66,26 +72,32 @@ impl<const R: usize> GCounter<R> {
         Self { slots: [None; R] }
     }
 
-    /// Adds `by` to `replica`'s own count, saturating at [`u64::MAX`].
+    /// Adds `by` to `replica`'s own count. Adding zero is honoured and
+    /// changes nothing: it claims no slot.
     ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] when `replica` has no slot yet and all `R` are
-    /// taken.
-    pub fn increment(&mut self, replica: ReplicaId, by: u64) -> Result<(), CapacityError> {
-        let entry = self.entry_mut(replica).ok_or(CapacityError)?;
-        entry.count = entry.count.saturating_add(by);
+    /// [`Refusal::Full`] when `replica` has no slot yet and all `R` are taken,
+    /// [`Refusal::Overflow`] when the count would pass [`u64::MAX`]. Either
+    /// way the counter is unchanged.
+    pub fn increment(&mut self, replica: ReplicaId, by: u64) -> Result<(), Refusal> {
+        if by == 0 {
+            return Ok(());
+        }
+        if let Some(entry) = self.held_mut(replica) {
+            entry.count = entry.count.checked_add(by).ok_or(Refusal::Overflow)?;
+            return Ok(());
+        }
+        let free = self.slots.iter_mut().find(|slot| slot.is_none());
+        let slot = free.ok_or(Refusal::Full)?;
+        *slot = Some(Entry { replica, count: by });
         Ok(())
     }
 
     /// What `replica` has added, zero if it has no slot here.
     #[must_use]
     pub fn count(&self, replica: ReplicaId) -> u64 {
-        self.slots
-            .iter()
-            .flatten()
-            .find(|entry| entry.replica == replica)
-            .map_or(0, |entry| entry.count)
+        self.held(replica).map_or(0, |entry| entry.count)
     }
 
     /// Every replica's count, totalled wide enough never to clamp.
@@ -99,13 +111,27 @@ impl<const R: usize> GCounter<R> {
         self.slots.iter().flatten().copied()
     }
 
-    /// Raises `replica`'s count to `count` if that is higher.
-    fn raise(&mut self, replica: ReplicaId, count: u64) -> Result<(), CapacityError> {
-        let entry = self.entry_mut(replica).ok_or(CapacityError)?;
-        if count > entry.count {
-            entry.count = count;
+    /// Whether every replica `other` counts and this counter does not fits in
+    /// a free slot here.
+    pub(crate) fn fits(&self, other: &Self) -> bool {
+        let unseen = other
+            .entries()
+            .filter(|entry| self.held(entry.replica).is_none())
+            .count();
+        unseen <= self.slots.iter().filter(|slot| slot.is_none()).count()
+    }
+
+    /// Folds `other` in, once [`fits`](Self::fits) has said it can land whole.
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        let mut unseen = [false; R];
+        for (mark, slot) in unseen.iter_mut().zip(&other.slots) {
+            let Some(entry) = slot else { continue };
+            match self.held_mut(entry.replica) {
+                Some(held) => held.count = held.count.max(entry.count),
+                None => *mark = true,
+            }
         }
-        Ok(())
+        fill_free(&mut self.slots, &other.slots, &unseen);
     }
 
     /// Length of the [`encode`](Self::encode) frame.
@@ -114,22 +140,7 @@ impl<const R: usize> GCounter<R> {
     /// Length of the slot table a frame carries after its tag and shape.
     pub(crate) const BODY_LEN: usize = RECORDS + R * RECORD_LEN;
 
-    /// Writes the counter into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The counter's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("counter");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -154,10 +165,12 @@ impl<const R: usize> GCounter<R> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure, [`CodecError::Parameters`] when it was
-    /// written with another replica count.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure,
+    /// [`Refusal::WrongShape`] when it was written with another replica count,
+    /// [`Refusal::Malformed`] when it holds more records than slots, one
+    /// replica twice, or a zero count.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut counter = Self::new();
         counter.decode_into(bytes)?;
         Ok(counter)
@@ -170,52 +183,78 @@ impl<const R: usize> GCounter<R> {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GCOUNTER)?;
         if read_small(&frame[SHAPE]) != R {
-            return Err(CodecError::Parameters);
+            return Err(Refusal::WrongShape);
         }
 
-        self.read_body(&frame[BODY..]);
+        *self = Self::read_body(&frame[BODY..])?;
         Ok(())
     }
 
     /// Reads a slot table of exactly [`BODY_LEN`](Self::BODY_LEN) bytes.
-    pub(crate) fn read_body(&mut self, body: &[u8]) {
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Malformed`] for a table no sequence of calls produces.
+    pub(crate) fn read_body(body: &[u8]) -> Result<Self, Refusal> {
         let held = read_small(&body[HELD]);
+        if held > R {
+            return Err(Refusal::Malformed);
+        }
         let (records, _) = body[RECORDS..].as_chunks::<RECORD_LEN>();
 
-        self.slots = [None; R];
-        for (slot, record) in self.slots.iter_mut().zip(records.iter().take(held)) {
+        let mut counter = Self::new();
+        for (slot, record) in counter.slots.iter_mut().zip(records.iter().take(held)) {
             *slot = Some(Entry {
                 replica: read_u64(&record[REPLICA]),
                 count: read_u64(&record[COUNT]),
             });
         }
+        let repeated = |entry: Entry| {
+            let named = counter
+                .entries()
+                .filter(|other| other.replica == entry.replica);
+            named.count() > 1
+        };
+        if counter
+            .entries()
+            .any(|entry| entry.count == 0 || repeated(entry))
+        {
+            return Err(Refusal::Malformed);
+        }
+        Ok(counter)
     }
 
-    fn entry_mut(&mut self, replica: ReplicaId) -> Option<&mut Entry> {
-        let held = self
-            .slots
+    fn held(&self, replica: ReplicaId) -> Option<&Entry> {
+        self.slots
             .iter()
-            .position(|slot| matches!(slot, Some(entry) if entry.replica == replica));
-        if let Some(index) = held {
-            return self.slots[index].as_mut();
-        }
+            .flatten()
+            .find(|entry| entry.replica == replica)
+    }
 
-        let free = free_slot(&self.slots)?;
-        self.slots[free] = Some(Entry { replica, count: 0 });
-        self.slots[free].as_mut()
+    fn held_mut(&mut self, replica: ReplicaId) -> Option<&mut Entry> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.replica == replica)
     }
 }
 
 impl<const R: usize> Merge for GCounter<R> {
-    type Error = CapacityError;
+    type Error = Refusal;
 
+    /// # Errors
+    ///
+    /// [`Refusal::Full`] when the replicas `other` counts and this counter
+    /// does not outnumber the free slots. Checked before anything moves, so a
+    /// refused merge leaves the counter exactly as it was.
     fn merge(&mut self, other: &Self) -> Result<(), Self::Error> {
-        for entry in other.entries() {
-            self.raise(entry.replica, entry.count)?;
+        if !self.fits(other) {
+            return Err(Refusal::Full);
         }
+        self.absorb(other);
         Ok(())
     }
 }

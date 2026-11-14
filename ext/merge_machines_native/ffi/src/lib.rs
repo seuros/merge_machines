@@ -1,215 +1,178 @@
-//! Ruby bindings for the `merge-machines` replicated states.
+//! Ruby bindings for the `merge-machines` replicated states: a thin mirror.
 //!
 //! Replica counts and set capacities are const generics, so every class
 //! dispatches the number it is given to a fixed set of monomorphised variants
-//! and raises `ArgumentError` for any other number.
+//! and raises `RangeError` for any other number. Elements, values, replica ids,
+//! tags and stamps are unsigned 64-bit Integers, as on a core frame.
 //!
-//! Wall-clock readings are nanoseconds on both sides of this boundary.
-//! `NS_PER_SECOND` is exposed for callers holding seconds.
-
-#![allow(clippy::needless_pass_by_value)]
+//! Every refusal comes back as the `snake_case` symbol of its `Refusal` variant
+//! and never raises. A frame `decode` refuses raises `RangeError`: it is saved
+//! state a restoring constructor turned down.
 
 mod data;
 mod gcounter;
 mod gset;
-mod hash;
 mod hybrid;
 mod logical;
 mod lww;
-mod names;
 mod orset;
 mod pncounter;
 mod shape;
-mod wall;
 
-use std::sync::OnceLock;
+use std::cell::RefCell;
 
-use magnus::scan_args::get_kwargs;
-use magnus::value::Opaque;
-use magnus::{Error, ExceptionClass, Integer, RHash, RModule, Ruby, TryConvert, Value, prelude::*};
-use merge_machines::{CapacityError, ClockExhausted, CodecError, ReplicaId};
-
-/// `MergeMachines::Full`, defined in [`init`].
-static FULL: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
-
-/// `MergeMachines::Exhausted`, defined in [`init`].
-static EXHAUSTED: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
-
-/// Nanoseconds in a second.
-pub(crate) const NS_PER_SECOND: u32 = 1_000_000_000;
-
-/// Replica counts the counters are monomorphised for.
-pub(crate) const REPLICAS: [usize; 4] = [4, 8, 16, 32];
-
-/// Capacities the sets are monomorphised for.
-pub(crate) const CAPACITIES: [usize; 3] = [64, 256, 1024];
+use magnus::rb_sys::AsRawValue;
+use magnus::value::ReprValue;
+use magnus::{Error, Integer, RClass, Ruby, Symbol, TryConvert, Value};
+use merge_machines::Refusal;
 
 /// Where a core frame names the shape it was written at.
 pub(crate) const SHAPE: core::ops::Range<usize> = 1..3;
 
-/// Bytes a 64-bit field occupies in a blob.
-pub(crate) const FIELD_LEN: usize = 8;
-
-/// The low [`FIELD_LEN`] bytes of `value`, little-endian.
-pub(crate) fn field(value: usize) -> [u8; FIELD_LEN] {
-    let mut bytes = [0_u8; FIELD_LEN];
-    for (slot, byte) in bytes.iter_mut().zip(value.to_le_bytes()) {
-        *slot = byte;
-    }
-    bytes
-}
-
-/// A whole number of things: a stamp, a replica, a capacity, a counter, a
-/// nanosecond reading.
+/// A whole number of things: a replica, an element, a stamp, a capacity, a
+/// count, a nanosecond reading.
 ///
 /// magnus reads an integer through Ruby's `NUM2*` family, which truncates a
 /// `Float` towards zero instead of refusing it, so an argument that means an
-/// integer is read as one of these and anything but an `Integer` is turned
-/// away. An `Integer` outside the target width still comes back as the
-/// `RangeError` magnus raises for it.
+/// integer is read as one of these and anything but an `Integer` is a
+/// `TypeError`. An `Integer` outside the target width, negative ones included,
+/// is the `RangeError` magnus raises for it.
 pub(crate) struct Whole<T>(pub(crate) T);
 
 impl<T: TryConvert> TryConvert for Whole<T> {
     fn try_convert(value: Value) -> Result<Self, Error> {
         if Integer::from_value(value).is_none() {
-            return Err(not_whole(value));
+            let ruby = Ruby::get_with(value);
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                format!(
+                    "no implicit conversion of {} into Integer: {}",
+                    value.class(),
+                    value.inspect()
+                ),
+            ));
         }
         T::try_convert(value).map(Self)
     }
 }
 
-fn not_whole(value: Value) -> Error {
-    let ruby = Ruby::get_with(value);
+/// The symbol a refusal comes back to Ruby as.
+pub(crate) const fn refusal_name(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::Full => "full",
+        Refusal::Overflow => "overflow",
+        Refusal::Exhausted => "exhausted",
+        Refusal::Mismatch => "mismatch",
+        Refusal::Truncated => "truncated",
+        Refusal::WrongStructure => "wrong_structure",
+        Refusal::WrongShape => "wrong_shape",
+        Refusal::Malformed => "malformed",
+    }
+}
+
+pub(crate) fn refusal(ruby: &Ruby, refusal: Refusal) -> Symbol {
+    ruby.to_symbol(refusal_name(refusal))
+}
+
+/// `honoured` for an honoured unit answer, the refusal's symbol otherwise.
+pub(crate) fn unit(ruby: &Ruby, outcome: Result<(), Refusal>, honoured: &str) -> Symbol {
+    match outcome {
+        Ok(()) => ruby.to_symbol(honoured),
+        Err(refused) => refusal(ruby, refused),
+    }
+}
+
+/// `:merged` or the refusal's symbol; the `TypeError` naming `what` when
+/// `other` held another shape and nothing was folded.
+pub(crate) fn merged(
+    ruby: &Ruby,
+    outcome: Option<Result<(), Refusal>>,
+    other: Value,
+    what: &str,
+) -> Result<Symbol, Error> {
+    outcome
+        .map(|outcome| unit(ruby, outcome, "merged"))
+        .ok_or_else(|| expected(ruby, what, other))
+}
+
+/// Runs `act` on a copy of the state in `cell` and keeps the copy only once
+/// `act`, which builds the answer and may run Ruby, has returned. A raise
+/// while building leaves the state as it was, so no work is lost. Right
+/// before the store the receiver is checked again: frozen meanwhile (a
+/// redefined `new` freezing it) raises `FrozenError`, changed meanwhile (a
+/// redefined `new` calling back in) raises `RuntimeError`, and in both cases
+/// the copy is not applied.
+pub(crate) fn on_copy<T: Clone + PartialEq, R>(
+    ruby: &Ruby,
+    receiver: impl ReprValue,
+    cell: &RefCell<T>,
+    act: impl FnOnce(&mut T) -> Result<R, Error>,
+) -> Result<R, Error> {
+    receiver.check_frozen()?;
+    let before = cell.borrow().clone();
+    let mut after = before.clone();
+    let answer = act(&mut after)?;
+    receiver.check_frozen()?;
+    let mut held = cell.borrow_mut();
+    if *held != before {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "the state changed while the answer was built; the call was not applied",
+        ));
+    }
+    *held = after;
+    Ok(answer)
+}
+
+/// Whether `value` is an instance of exactly `class`: the classes compared by
+/// identity, which no Ruby method can be redefined to fake. A subclass (whose
+/// constant leaks past the seal) is refused, and so is a value given a
+/// singleton class.
+pub(crate) fn instance_of(value: Value, class: RClass) -> bool {
+    value.class().as_raw() == class.as_raw()
+}
+
+/// The `RangeError` for a frame `decode` turned down.
+pub(crate) fn refused_frame(ruby: &Ruby, refused: Refusal) -> Error {
     Error::new(
-        ruby.exception_type_error(),
-        format!(
-            "no implicit conversion of {} into Integer: {}",
-            value.class(),
-            value.inspect()
-        ),
+        ruby.exception_range_error(),
+        format!("the frame is refused: {}", refusal_name(refused)),
     )
 }
 
-/// The one required keyword of a constructor.
-pub(crate) fn required_kwarg<T: TryConvert>(keywords: RHash, name: &str) -> Result<T, Error> {
-    Ok(get_kwargs::<_, (T,), (), ()>(keywords, &[name], &[])?
-        .required
-        .0)
-}
-
-/// A keyword with a default the caller may leave out.
-pub(crate) fn optional_kwarg<T: TryConvert>(
-    keywords: RHash,
-    name: &str,
-) -> Result<Option<T>, Error> {
-    Ok(
-        get_kwargs::<_, (), (Option<T>,), ()>(keywords, &[], &[name])?
-            .optional
-            .0,
-    )
-}
-
-/// The shape a blob was written at, read from its core frame.
-pub(crate) fn blob_shape(ruby: &Ruby, blob: &[u8]) -> Result<usize, Error> {
-    let Some(field) = blob.get(SHAPE) else {
-        return Err(codec_error(ruby, CodecError::Truncated));
+/// The shape a frame was written at, read from its header.
+pub(crate) fn frame_shape(ruby: &Ruby, frame: &[u8]) -> Result<usize, Error> {
+    let Some(field) = frame.get(SHAPE) else {
+        return Err(refused_frame(ruby, Refusal::Truncated));
     };
     Ok(usize::from(u16::from_le_bytes([field[0], field[1]])))
 }
 
-/// The replica id a clock's blob carries after its core frame.
-pub(crate) fn trailing_replica(
-    ruby: &Ruby,
-    blob: &[u8],
-    frame_len: usize,
-) -> Result<ReplicaId, Error> {
-    let Some((field, _)) = blob
-        .get(frame_len..)
-        .and_then(<[u8]>::split_first_chunk::<FIELD_LEN>)
-    else {
-        return Err(codec_error(ruby, CodecError::Truncated));
-    };
-    Ok(u64::from_le_bytes(*field))
-}
-
 pub(crate) fn unsupported(ruby: &Ruby, name: &str, given: usize, supported: &[usize]) -> Error {
     Error::new(
-        ruby.exception_arg_error(),
+        ruby.exception_range_error(),
         format!("{name} {given} is not supported, expected one of {supported:?}"),
     )
 }
 
-pub(crate) fn unsupported_blob(ruby: &Ruby, name: &str, supported: &[usize]) -> Error {
+/// The `TypeError` for an argument of the wrong class.
+pub(crate) fn expected(ruby: &Ruby, what: &str, given: Value) -> Error {
     Error::new(
-        ruby.exception_arg_error(),
-        format!("blob was written with a {name} outside {supported:?}"),
-    )
-}
-
-pub(crate) fn codec_error(ruby: &Ruby, error: CodecError) -> Error {
-    Error::new(ruby.exception_arg_error(), format!("codec: {error}"))
-}
-
-pub(crate) fn mismatch(ruby: &Ruby, name: &str) -> Error {
-    Error::new(
-        ruby.exception_arg_error(),
-        format!("the other {name} has a different shape"),
+        ruby.exception_type_error(),
+        format!("expected {what}, got {}", given.inspect()),
     )
 }
 
 pub(crate) fn uninitialised(ruby: &Ruby) -> Error {
     Error::new(
-        ruby.exception_runtime_error(),
+        ruby.exception_load_error(),
         "the merge_machines extension is not initialised",
     )
-}
-
-pub(crate) fn defined_twice(ruby: &Ruby, name: &str) -> Error {
-    Error::new(
-        ruby.exception_runtime_error(),
-        format!("MergeMachines::{name} was initialised twice"),
-    )
-}
-
-/// Raises `MergeMachines::Full` for a state that ran out of slots.
-pub(crate) fn capacity(ruby: &Ruby, outcome: Result<(), CapacityError>) -> Result<(), Error> {
-    outcome.map_err(|error| raised(ruby, &FULL, error.to_string()))
-}
-
-/// Raises `MergeMachines::Exhausted` for a clock that ran out of timestamps.
-pub(crate) fn exhausted<T>(ruby: &Ruby, outcome: Result<T, ClockExhausted>) -> Result<T, Error> {
-    outcome.map_err(|error| raised(ruby, &EXHAUSTED, error.to_string()))
-}
-
-/// Raises `MergeMachines::Exhausted` for a set that ran out of tags.
-pub(crate) fn tags_exhausted(ruby: &Ruby) -> Error {
-    raised(ruby, &EXHAUSTED, "no tag left".to_owned())
-}
-
-fn raised(ruby: &Ruby, class: &OnceLock<Opaque<ExceptionClass>>, message: String) -> Error {
-    class.get().map_or_else(
-        || uninitialised(ruby),
-        |class| Error::new(ruby.get_inner(*class), message),
-    )
-}
-
-fn define_errors(ruby: &Ruby, module: RModule) -> Result<(), Error> {
-    let base = module.define_error("Error", ruby.exception_standard_error())?;
-    let full = module.define_error("Full", base)?;
-    FULL.set(full.into())
-        .map_err(|_| defined_twice(ruby, "Full"))?;
-    let exhausted = module.define_error("Exhausted", base)?;
-    EXHAUSTED
-        .set(exhausted.into())
-        .map_err(|_| defined_twice(ruby, "Exhausted"))
 }
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("MergeMachines")?;
-    module.const_set("NS_PER_SECOND", NS_PER_SECOND)?;
-    define_errors(ruby, module)?;
-    wall::define(ruby)?;
     data::define(ruby, module)?;
     logical::define(ruby, module)?;
     hybrid::define(ruby, module)?;

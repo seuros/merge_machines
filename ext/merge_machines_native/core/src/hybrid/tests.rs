@@ -1,9 +1,9 @@
-use crate::{ClockExhausted, CodecError, HybridClock, HybridTimestamp};
+use crate::{HybridClock, HybridTimestamp, Refusal};
 
 const MS: u64 = 1_000_000;
 
 /// What a test that stamps events returns.
-type Stamped = Result<(), ClockExhausted>;
+type Stamped = Result<(), Refusal>;
 
 #[test]
 fn timestamps_keep_rising_while_the_wall_clock_falls() -> Stamped {
@@ -93,9 +93,9 @@ fn a_counter_with_nothing_left_refuses_to_reissue_its_last_timestamp() {
     let mut clock = HybridClock::new();
 
     assert_eq!(clock.observe(0, crowded), Ok(full));
-    assert_eq!(clock.tick(7 * MS), Err(ClockExhausted));
-    assert_eq!(clock.tick(2 * MS), Err(ClockExhausted));
-    assert_eq!(clock.observe(0, crowded), Err(ClockExhausted));
+    assert_eq!(clock.tick(7 * MS), Err(Refusal::Exhausted));
+    assert_eq!(clock.tick(2 * MS), Err(Refusal::Exhausted));
+    assert_eq!(clock.observe(0, crowded), Err(Refusal::Exhausted));
     assert_eq!(clock.last(), full);
 
     assert_eq!(
@@ -108,7 +108,7 @@ fn a_counter_with_nothing_left_refuses_to_reissue_its_last_timestamp() {
 
     let mut fresh = HybridClock::new();
 
-    assert_eq!(fresh.observe(0, full), Err(ClockExhausted));
+    assert_eq!(fresh.observe(0, full), Err(Refusal::Exhausted));
     assert_eq!(fresh.last(), HybridTimestamp::default());
 }
 
@@ -130,77 +130,4 @@ fn ordering_is_by_reading_then_counter() {
             counter: 10
         } > early
     );
-}
-
-#[test]
-fn a_frame_round_trips_the_last_timestamp_issued() -> Stamped {
-    let mut clock = HybridClock::new();
-    clock.tick(900)?;
-    clock.tick(900)?;
-
-    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
-    assert_eq!(clock.encode(&mut frame), Ok(HybridClock::ENCODED_LEN));
-
-    let restored = HybridClock::decode(&frame);
-    assert_eq!(restored, Ok(clock));
-    assert_eq!(
-        restored.map(|clock| clock.last()),
-        Ok(HybridTimestamp {
-            wall_ns: 900,
-            counter: 1,
-        })
-    );
-    Ok(())
-}
-
-#[test]
-fn encoding_into_a_short_buffer_is_refused() {
-    let mut frame = [0_u8; HybridClock::ENCODED_LEN - 1];
-
-    assert_eq!(
-        HybridClock::new().encode(&mut frame),
-        Err(CodecError::Truncated)
-    );
-}
-
-#[test]
-fn a_short_frame_is_refused() {
-    assert_eq!(HybridClock::decode(&[]), Err(CodecError::Truncated));
-}
-
-#[test]
-fn another_structures_frame_is_refused() {
-    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
-    assert_eq!(
-        HybridClock::new().encode(&mut frame),
-        Ok(HybridClock::ENCODED_LEN)
-    );
-    frame[crate::TAG] = crate::TAG_LOGICAL_CLOCK;
-
-    assert_eq!(HybridClock::decode(&frame), Err(CodecError::Tag));
-}
-
-#[test]
-fn a_refused_frame_leaves_the_clock_alone() -> Stamped {
-    let mut clock = HybridClock::new();
-    clock.tick(5)?;
-    let before = clock;
-
-    assert_eq!(clock.decode_into(&[]), Err(CodecError::Truncated));
-
-    assert_eq!(clock, before);
-    Ok(())
-}
-
-#[cfg(feature = "alloc")]
-#[test]
-fn the_allocated_frame_is_the_frame() -> Stamped {
-    let mut clock = HybridClock::new();
-    clock.tick(17)?;
-
-    let mut frame = [0_u8; HybridClock::ENCODED_LEN];
-    assert_eq!(clock.encode(&mut frame), Ok(HybridClock::ENCODED_LEN));
-
-    assert_eq!(*clock.encoded(), frame);
-    Ok(())
 }

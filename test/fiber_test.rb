@@ -3,46 +3,43 @@
 require 'test_helper'
 
 module MergeMachines
-  # The largest shape of every state, built, dumped and loaded inside a fiber's
-  # machine stack.
+  # The largest shape of every state, built, encoded and decoded inside a
+  # fiber's machine stack.
   class FiberTest < Minitest::Test
     def test_the_largest_shape_of_every_state_fits_a_fiber
       readings = Fiber.new do
-        [
-          largest_counter,
-          largest_signed_counter,
-          largest_set,
-          largest_removable_set
-        ]
+        [largest_counter, largest_signed_counter, largest_set, largest_removable_set]
       end.resume
 
-      assert_equal [3, -3, %w[k], %w[k]], readings
+      assert_equal [3, -3, [7], [7]], readings
     end
 
     private
 
     def largest_counter
-      counter = GCounter.new(replicas: 32)
-      counter.increment(replica: 31, by: 3)
-      GCounter.load(counter.dump).value
+      counter = GCounter.new(32)
+      counter.increment(31, 3)
+      GCounter.decode(counter.encoded).value
     end
 
     def largest_signed_counter
-      counter = PNCounter.new(replicas: 32)
-      counter.decrement(replica: 31, by: 3)
-      PNCounter.load(counter.dump).value
+      counter = PNCounter.new(32)
+      counter.decrement(31, 3)
+      PNCounter.decode(counter.encoded).value
     end
 
     def largest_set
-      set = GSet.new(capacity: 1024)
-      set.add('k')
-      GSet.load(set.dump).members
+      set = GSet.new(1024)
+      set.insert(7)
+      GSet.decode(set.encoded).to_a
     end
 
     def largest_removable_set
-      set = OrSet.new(capacity: 1024)
-      set.add('k', replica: 1)
-      OrSet.load(set.dump).members
+      set = OrSet.new(1024)
+      set.add(7, Tag.new(1, 1))
+      other = OrSet.new(1024)
+      other.merge(set)
+      OrSet.decode(other.encoded).to_a
     end
   end
 end

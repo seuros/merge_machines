@@ -1,11 +1,8 @@
 //! Observed-remove set: a remove only takes out the adds it has seen.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN,
-    TAG_ORSET, free_slot, read_small, read_u64, same_elements, small_field, tagged_frame,
-    write_into,
+    COUNT_LEN, FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_ORSET, fill_free,
+    fits_free, read_small, read_u64, same_elements, small_field, tagged_frame,
 };
 
 /// Bytes one tombstone record occupies: the tag's replica then its counter.
@@ -39,7 +36,7 @@ const REMOVES_HELD: core::ops::Range<usize> = ADDS_HELD.end..ADDS_HELD.end + COU
 const ADDS: usize = REMOVES_HELD.end;
 
 /// Which add a remove is talking about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tag {
     /// The replica that made the add.
     pub replica: ReplicaId,
@@ -48,6 +45,9 @@ pub struct Tag {
 }
 
 impl Tag {
+    /// The tag `replica` made an add under at `counter`. The caller keeps each
+    /// replica's counters unique; the set issues none. Every pair is a valid
+    /// tag.
     #[must_use]
     pub const fn new(replica: ReplicaId, counter: u64) -> Self {
         Self { replica, counter }
@@ -55,7 +55,7 @@ impl Tag {
 }
 
 /// An element and the tag it was added under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tagged<T> {
     /// The element added.
     pub element: T,
@@ -63,77 +63,113 @@ pub struct Tagged<T> {
     pub tag: Tag,
 }
 
+impl<T> Tagged<T> {
+    /// `element`, added under `tag`. Every pair is a valid add.
+    #[must_use]
+    pub const fn new(element: T, tag: Tag) -> Self {
+        Self { element, tag }
+    }
+}
+
+/// What an honoured [`OrSet::add`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adding {
+    /// The add was new and is now held.
+    Added,
+    /// This tag already added this element; nothing changed.
+    Duplicate,
+}
+
+/// What an honoured [`OrSet::remove`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removing {
+    /// Every live add of the element is tombstoned now.
+    Removed,
+    /// No live add of the element was held; nothing changed.
+    NotHeld,
+}
+
+/// One add the set has seen, and whether a remove has tombstoned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen<T> {
+    add: Tagged<T>,
+    removed: bool,
+}
+
 /// A set elements can leave, where concurrent adds survive a remove.
 ///
+/// A tombstone lives on the add it removes, so the `N` slots bound the adds
+/// and a remove never needs a slot.
+///
 /// ```
-/// use merge_machines::{Merge, OrSet, Tag};
+/// use merge_machines::{Adding, Merge, OrSet, Removing, Tag};
 ///
 /// let mut left = OrSet::<u16, 8>::new();
-/// assert_eq!(left.add(1, Tag::new(1, 1)), Ok(()));
+/// assert_eq!(left.add(1, Tag::new(1, 1)), Ok(Adding::Added));
 /// let mut right = left;
 ///
 /// // One side removes what it has seen while the other adds the same element
 /// // again under its own tag.
-/// assert_eq!(left.remove(&1), Ok(()));
-/// assert_eq!(right.add(1, Tag::new(2, 1)), Ok(()));
+/// assert_eq!(left.remove(&1), Removing::Removed);
+/// assert_eq!(right.add(1, Tag::new(2, 1)), Ok(Adding::Added));
 ///
 /// assert_eq!(left.merge(&right), Ok(()));
 /// assert!(left.contains(&1));
 /// ```
 #[derive(Debug, Clone, Copy, Eq)]
 pub struct OrSet<T, const N: usize> {
-    adds: [Option<Tagged<T>>; N],
-    removes: [Option<Tag>; N],
+    slots: [Option<Seen<T>>; N],
 }
 
 impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            adds: [const { None }; N],
-            removes: [None; N],
+            slots: [const { None }; N],
         }
     }
 
-    /// Records `element` added under `tag`.
+    /// Records `element` added under `tag`. The same tag adding the same
+    /// element again is an honoured repeat, [`Adding::Duplicate`], tombstoned
+    /// or not, and changes nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] when `tag` is new and all `N` add slots are
-    /// taken.
-    pub fn add(&mut self, element: T, tag: Tag) -> Result<(), CapacityError> {
-        if self.added(tag) {
-            return Ok(());
+    /// [`Refusal::Mismatch`] when `tag` already added another element,
+    /// [`Refusal::Full`] when `tag` is new and all `N` slots are taken. Either
+    /// way the set is unchanged.
+    pub fn add(&mut self, element: T, tag: Tag) -> Result<Adding, Refusal> {
+        if let Some(seen) = self.seen(tag) {
+            return if seen.add.element == element {
+                Ok(Adding::Duplicate)
+            } else {
+                Err(Refusal::Mismatch)
+            };
         }
-        let free = free_slot(&self.adds).ok_or(CapacityError)?;
-        self.adds[free] = Some(Tagged { element, tag });
-        Ok(())
+        let free = self.slots.iter_mut().find(|slot| slot.is_none());
+        *free.ok_or(Refusal::Full)? = Some(Seen {
+            add: Tagged { element, tag },
+            removed: false,
+        });
+        Ok(Adding::Added)
     }
 
-    /// Tombstones every tag this replica has seen for `element`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CapacityError`] when the tombstones do not fit in `N` slots.
-    pub fn remove(&mut self, element: &T) -> Result<(), CapacityError> {
-        let mut cursor = 0;
-        while cursor < N {
-            if let Some(add) = self.adds[cursor]
-                && add.element == *element
-            {
-                self.tombstone(add.tag)?;
+    /// Tombstones every add of `element` this replica has seen. With none
+    /// live, the answer is [`Removing::NotHeld`] and nothing changes.
+    pub fn remove(&mut self, element: &T) -> Removing {
+        let mut answer = Removing::NotHeld;
+        for seen in self.slots.iter_mut().flatten() {
+            if seen.add.element == *element && !seen.removed {
+                seen.removed = true;
+                answer = Removing::Removed;
             }
-            cursor += 1;
         }
-        Ok(())
+        answer
     }
 
     #[must_use]
     pub fn contains(&self, element: &T) -> bool {
-        self.adds
-            .iter()
-            .flatten()
-            .any(|add| add.element == *element && !self.removed(add.tag))
+        self.live().any(|add| add.element == *element)
     }
 
     /// How many distinct elements are in the set.
@@ -144,52 +180,44 @@ impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.live().next().is_none()
     }
 
     /// The elements still in the set, each once, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
-        self.adds
-            .iter()
-            .enumerate()
-            .filter_map(move |(index, slot)| {
-                let add = (*slot)?;
-                if self.removed(add.tag) {
-                    return None;
-                }
-                let earlier = self.adds[..index]
-                    .iter()
-                    .flatten()
-                    .any(|other| other.element == add.element && !self.removed(other.tag));
-                if earlier { None } else { Some(add.element) }
-            })
+        self.live().enumerate().filter_map(move |(index, add)| {
+            let earlier = self
+                .live()
+                .take(index)
+                .any(|other| other.element == add.element);
+            if earlier { None } else { Some(add.element) }
+        })
     }
 
     /// Every add this replica has seen, tombstoned or not.
     pub fn adds(&self) -> impl Iterator<Item = Tagged<T>> + '_ {
-        self.adds.iter().flatten().copied()
+        self.slots.iter().flatten().map(|seen| seen.add)
     }
 
     /// Every tag this replica has tombstoned.
     pub fn removes(&self) -> impl Iterator<Item = Tag> + '_ {
-        self.removes.iter().flatten().copied()
+        let removed = self.slots.iter().flatten().filter(|seen| seen.removed);
+        removed.map(|seen| seen.add.tag)
     }
 
-    fn added(&self, tag: Tag) -> bool {
-        self.adds.iter().flatten().any(|add| add.tag == tag)
+    /// The adds no remove has tombstoned.
+    fn live(&self) -> impl Iterator<Item = Tagged<T>> + '_ {
+        let live = self.slots.iter().flatten().filter(|seen| !seen.removed);
+        live.map(|seen| seen.add)
     }
 
-    fn removed(&self, tag: Tag) -> bool {
-        self.removes.iter().flatten().any(|held| *held == tag)
+    fn seen(&self, tag: Tag) -> Option<&Seen<T>> {
+        self.slots.iter().flatten().find(|seen| seen.add.tag == tag)
     }
 
-    fn tombstone(&mut self, tag: Tag) -> Result<(), CapacityError> {
-        if self.removed(tag) {
-            return Ok(());
-        }
-        let free = free_slot(&self.removes).ok_or(CapacityError)?;
-        self.removes[free] = Some(tag);
-        Ok(())
+    fn seen_mut(&mut self, tag: Tag) -> Option<&mut Seen<T>> {
+        let mut slots = self.slots.iter_mut().flatten();
+        slots.find(|seen| seen.add.tag == tag)
     }
 }
 
@@ -200,22 +228,7 @@ impl<const N: usize> OrSet<u64, N> {
     /// Length of the [`encode`](Self::encode) frame.
     pub const ENCODED_LEN: usize = Self::REMOVES + N * TOMBSTONE_LEN;
 
-    /// Writes the set into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("set");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -241,10 +254,12 @@ impl<const N: usize> OrSet<u64, N> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure, [`CodecError::Parameters`] when it was
-    /// written with another capacity.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure,
+    /// [`Refusal::WrongShape`] when it was written with another capacity,
+    /// [`Refusal::Malformed`] when it holds more records than slots, one tag
+    /// twice, or a tombstone for an add it does not hold.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut set = Self::new();
         set.decode_into(bytes)?;
         Ok(set)
@@ -257,33 +272,43 @@ impl<const N: usize> OrSet<u64, N> {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_ORSET)?;
         if read_small(&frame[SHAPE]) != N {
-            return Err(CodecError::Parameters);
+            return Err(Refusal::WrongShape);
         }
 
         let adds_held = read_small(&frame[ADDS_HELD]);
         let removes_held = read_small(&frame[REMOVES_HELD]);
+        if adds_held > N || removes_held > adds_held {
+            return Err(Refusal::Malformed);
+        }
 
+        let mut set = Self::new();
         let (records, _) = frame[ADDS..Self::REMOVES].as_chunks::<ADD_LEN>();
-        self.adds = [const { None }; N];
-        for (slot, record) in self.adds.iter_mut().zip(records.iter().take(adds_held)) {
-            *slot = Some(Tagged {
+        for (slot, record) in set.slots.iter_mut().zip(records.iter().take(adds_held)) {
+            let add = Tagged {
                 element: read_u64(&record[ELEMENT]),
                 tag: read_tag(&record[TAGGED]),
+            };
+            *slot = Some(Seen {
+                add,
+                removed: false,
             });
+        }
+        let repeated = |tag: Tag| set.adds().filter(|add| add.tag == tag).count() > 1;
+        if set.adds().any(|add| repeated(add.tag)) {
+            return Err(Refusal::Malformed);
         }
 
         let (records, _) = frame[Self::REMOVES..].as_chunks::<TOMBSTONE_LEN>();
-        self.removes = [None; N];
-        for (slot, record) in self
-            .removes
-            .iter_mut()
-            .zip(records.iter().take(removes_held))
-        {
-            *slot = Some(read_tag(record));
+        for record in records.iter().take(removes_held) {
+            match set.seen_mut(read_tag(record)) {
+                Some(seen) if !seen.removed => seen.removed = true,
+                Some(_) | None => return Err(Refusal::Malformed),
+            }
         }
+        *self = set;
         Ok(())
     }
 }
@@ -303,15 +328,36 @@ fn read_tag(field: &[u8]) -> Tag {
 }
 
 impl<T: Copy + PartialEq, const N: usize> Merge for OrSet<T, N> {
-    type Error = CapacityError;
+    type Error = Refusal;
 
+    /// # Errors
+    ///
+    /// [`Refusal::Mismatch`] when one tag added different elements on the two
+    /// sides, [`Refusal::Full`] when the adds `other` holds and this set does
+    /// not outnumber the free slots. Both are checked before anything moves,
+    /// so a refused merge leaves the set exactly as it was.
     fn merge(&mut self, other: &Self) -> Result<(), Self::Error> {
-        for add in other.adds() {
-            self.add(add.element, add.tag)?;
+        let mut unseen = [false; N];
+        for (mark, slot) in unseen.iter_mut().zip(&other.slots) {
+            let Some(theirs) = slot else { continue };
+            match self.seen(theirs.add.tag) {
+                Some(mine) if mine.add.element != theirs.add.element => {
+                    return Err(Refusal::Mismatch);
+                }
+                Some(_) => {}
+                None => *mark = true,
+            }
         }
-        for tag in other.removes() {
-            self.tombstone(tag)?;
+        if !fits_free(&self.slots, &unseen) {
+            return Err(Refusal::Full);
         }
+
+        for theirs in other.slots.iter().flatten().filter(|seen| seen.removed) {
+            if let Some(mine) = self.seen_mut(theirs.add.tag) {
+                mine.removed = true;
+            }
+        }
+        fill_free(&mut self.slots, &other.slots, &unseen);
         Ok(())
     }
 }
@@ -320,7 +366,7 @@ impl<T: Copy + PartialEq, const N: usize> Merge for OrSet<T, N> {
 /// tombstones, whatever order the slots were filled in.
 impl<T: PartialEq, const N: usize> PartialEq for OrSet<T, N> {
     fn eq(&self, other: &Self) -> bool {
-        same_elements(&self.adds, &other.adds) && same_elements(&self.removes, &other.removes)
+        same_elements(&self.slots, &other.slots)
     }
 }
 

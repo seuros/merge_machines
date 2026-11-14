@@ -1,10 +1,8 @@
 //! A counter that goes both ways, from two that only go up.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    CapacityError, CodecError, GCounter, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_PNCOUNTER,
-    read_small, small_field, tagged_frame, write_into,
+    GCounter, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_PNCOUNTER, read_small,
+    small_field, tagged_frame,
 };
 
 /// Where the shape sits in a frame.
@@ -42,19 +40,26 @@ impl<const R: usize> PNCounter<R> {
         }
     }
 
+    /// Adds `by` to what `replica` has added. Zero is honoured and changes
+    /// nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] when `replica` has no slot yet and all `R` are
-    /// taken.
-    pub fn increment(&mut self, replica: ReplicaId, by: u64) -> Result<(), CapacityError> {
+    /// [`Refusal::Full`] when `replica` has no slot on this side yet and all
+    /// `R` are taken, [`Refusal::Overflow`] when its count would pass
+    /// [`u64::MAX`]. Either way the counter is unchanged.
+    pub fn increment(&mut self, replica: ReplicaId, by: u64) -> Result<(), Refusal> {
         self.increments.increment(replica, by)
     }
 
+    /// Adds `by` to what `replica` has taken away. Zero is honoured and
+    /// changes nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] when `replica` has no slot yet and all `R` are
-    /// taken.
-    pub fn decrement(&mut self, replica: ReplicaId, by: u64) -> Result<(), CapacityError> {
+    /// The same as [`increment`](Self::increment), on the side that counts
+    /// what came down.
+    pub fn decrement(&mut self, replica: ReplicaId, by: u64) -> Result<(), Refusal> {
         self.decrements.increment(replica, by)
     }
 
@@ -82,22 +87,7 @@ impl<const R: usize> PNCounter<R> {
     /// Length of the [`encode`](Self::encode) frame.
     pub const ENCODED_LEN: usize = Self::DECREMENTS + GCounter::<R>::BODY_LEN;
 
-    /// Writes the counter into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The counter's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("counter");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -112,10 +102,12 @@ impl<const R: usize> PNCounter<R> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure, [`CodecError::Parameters`] when it was
-    /// written with another replica count.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure,
+    /// [`Refusal::WrongShape`] when it was written with another replica count,
+    /// [`Refusal::Malformed`] when either side's table is one no sequence of
+    /// calls produces.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut counter = Self::new();
         counter.decode_into(bytes)?;
         Ok(counter)
@@ -128,15 +120,18 @@ impl<const R: usize> PNCounter<R> {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_PNCOUNTER)?;
         if read_small(&frame[SHAPE]) != R {
-            return Err(CodecError::Parameters);
+            return Err(Refusal::WrongShape);
         }
 
-        self.increments
-            .read_body(&frame[INCREMENTS..Self::DECREMENTS]);
-        self.decrements.read_body(&frame[Self::DECREMENTS..]);
+        let increments = GCounter::read_body(&frame[INCREMENTS..Self::DECREMENTS])?;
+        let decrements = GCounter::read_body(&frame[Self::DECREMENTS..])?;
+        *self = Self {
+            increments,
+            decrements,
+        };
         Ok(())
     }
 }
@@ -147,11 +142,20 @@ fn total<const R: usize>(side: &GCounter<R>) -> i128 {
 }
 
 impl<const R: usize> Merge for PNCounter<R> {
-    type Error = CapacityError;
+    type Error = Refusal;
 
+    /// # Errors
+    ///
+    /// [`Refusal::Full`] when either side would need more slots than it has
+    /// free. Both sides are checked before either moves, so a refused merge
+    /// leaves the counter exactly as it was.
     fn merge(&mut self, other: &Self) -> Result<(), Self::Error> {
-        self.increments.merge(&other.increments)?;
-        self.decrements.merge(&other.decrements)
+        if !(self.increments.fits(&other.increments) && self.decrements.fits(&other.decrements)) {
+            return Err(Refusal::Full);
+        }
+        self.increments.absorb(&other.increments);
+        self.decrements.absorb(&other.decrements);
+        Ok(())
     }
 }
 

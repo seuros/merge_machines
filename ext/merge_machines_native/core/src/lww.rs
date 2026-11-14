@@ -1,12 +1,9 @@
 //! Last writer wins, with the replica id as the tie-break.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    CodecError, FIELD_LEN, Merge, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_LWW_REGISTER, read_small,
-    read_u64, small_field, tagged_frame, write_into,
+    FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_LWW_REGISTER, read_small,
+    read_u64, small_field, tagged_frame,
 };
-use core::convert::Infallible;
 
 /// A stamp naming one 64-bit counter, as [`LogicalClock`](crate::LogicalClock)
 /// issues.
@@ -55,10 +52,23 @@ const VALUE: core::ops::Range<usize> = STAMP_KIND.end..STAMP_KIND.end + FIELD_LE
 /// Where the writing replica sits in a frame.
 const REPLICA: core::ops::Range<usize> = VALUE.end..VALUE.end + FIELD_LEN;
 
+/// What an honoured [`LwwRegister::set`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writing {
+    /// The write beat the one held and is held now.
+    Written,
+    /// This very write, the same value under the same stamp and replica, is
+    /// already held; nothing changed.
+    Duplicate,
+    /// A later write is held, so this one lost and nothing changed. That is
+    /// the register working, not a refusal.
+    Superseded,
+}
+
 /// One value, held by whichever write was stamped last.
 ///
 /// ```
-/// use merge_machines::{LwwRegister, Merge};
+/// use merge_machines::{LwwRegister, Merge, Refusal, Writing};
 ///
 /// let mut left = LwwRegister::new(10_u32, 4_u64, 1);
 /// let right = LwwRegister::new(20, 9, 2);
@@ -66,9 +76,13 @@ const REPLICA: core::ops::Range<usize> = VALUE.end..VALUE.end + FIELD_LEN;
 /// assert_eq!(left.merge(&right), Ok(()));
 /// assert_eq!(*left.value(), 20);
 ///
-/// // A stamp from before the current one changes nothing.
-/// left.set(30, 1, 1);
+/// // A stamp from before the current one loses, and says so.
+/// assert_eq!(left.set(30, 1, 1), Ok(Writing::Superseded));
 /// assert_eq!(*left.value(), 20);
+///
+/// // The same stamp and replica can only ever name one value.
+/// assert_eq!(left.set(20, 9, 2), Ok(Writing::Duplicate));
+/// assert_eq!(left.set(21, 9, 2), Err(Refusal::Mismatch));
 ///
 /// // Equal stamps go to the higher replica id, from either side.
 /// let mut low = LwwRegister::new(1_u32, 5_u64, 1);
@@ -83,7 +97,8 @@ pub struct LwwRegister<T, S> {
     replica: ReplicaId,
 }
 
-impl<T: Clone, S: Ord + Copy> LwwRegister<T, S> {
+impl<T: Clone + PartialEq, S: Ord + Copy> LwwRegister<T, S> {
+    /// A register holding `value`, written by `replica` at `stamp`.
     #[must_use]
     pub const fn new(value: T, stamp: S, replica: ReplicaId) -> Self {
         Self {
@@ -94,11 +109,24 @@ impl<T: Clone, S: Ord + Copy> LwwRegister<T, S> {
     }
 
     /// Writes `value` if `(stamp, replica)` beats the write already held.
-    pub fn set(&mut self, value: T, stamp: S, replica: ReplicaId) {
-        if (stamp, replica) > (self.stamp, self.replica) {
-            self.value = value;
-            self.stamp = stamp;
-            self.replica = replica;
+    /// An older write is honoured as [`Writing::Superseded`], the write
+    /// already held as [`Writing::Duplicate`]; neither changes anything.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Mismatch`] when the held write has the same stamp and
+    /// replica and another value; the register is unchanged.
+    pub fn set(&mut self, value: T, stamp: S, replica: ReplicaId) -> Result<Writing, Refusal> {
+        match (stamp, replica).cmp(&(self.stamp, self.replica)) {
+            core::cmp::Ordering::Less => Ok(Writing::Superseded),
+            core::cmp::Ordering::Equal if value == self.value => Ok(Writing::Duplicate),
+            core::cmp::Ordering::Equal => Err(Refusal::Mismatch),
+            core::cmp::Ordering::Greater => {
+                self.value = value;
+                self.stamp = stamp;
+                self.replica = replica;
+                Ok(Writing::Written)
+            }
         }
     }
 
@@ -137,22 +165,7 @@ impl<S: Stamp> LwwRegister<u64, S> {
         }
     }
 
-    /// Writes the register into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The register's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("register");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -167,10 +180,10 @@ impl<S: Stamp> LwwRegister<u64, S> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure, [`CodecError::Parameters`] when it was
-    /// written with another kind of stamp.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure,
+    /// [`Refusal::WrongShape`] when it was written with another kind of stamp.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut register = Self::empty();
         register.decode_into(bytes)?;
         Ok(register)
@@ -183,10 +196,10 @@ impl<S: Stamp> LwwRegister<u64, S> {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LWW_REGISTER)?;
         if read_small(&frame[STAMP_KIND]) != usize::from(S::KIND) {
-            return Err(CodecError::Parameters);
+            return Err(Refusal::WrongShape);
         }
 
         self.value = read_u64(&frame[VALUE]);
@@ -196,16 +209,27 @@ impl<S: Stamp> LwwRegister<u64, S> {
     }
 }
 
-impl<T: Clone, S: Ord + Copy> Merge for LwwRegister<T, S> {
-    type Error = Infallible;
+impl<T: Clone + PartialEq, S: Ord + Copy> Merge for LwwRegister<T, S> {
+    type Error = Refusal;
 
+    /// Keeps whichever write was stamped last.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Mismatch`] when both hold a write with the same stamp and
+    /// replica and different values; the register is unchanged.
     fn merge(&mut self, other: &Self) -> Result<(), Self::Error> {
-        if (other.stamp, other.replica) > (self.stamp, self.replica) {
-            self.value.clone_from(&other.value);
-            self.stamp = other.stamp;
-            self.replica = other.replica;
+        match (other.stamp, other.replica).cmp(&(self.stamp, self.replica)) {
+            core::cmp::Ordering::Less => Ok(()),
+            core::cmp::Ordering::Equal if other.value == self.value => Ok(()),
+            core::cmp::Ordering::Equal => Err(Refusal::Mismatch),
+            core::cmp::Ordering::Greater => {
+                self.value.clone_from(&other.value);
+                self.stamp = other.stamp;
+                self.replica = other.replica;
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 

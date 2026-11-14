@@ -1,10 +1,8 @@
 //! A set that only grows.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    COUNT_LEN, CapacityError, CodecError, FIELD_LEN, Merge, SHAPE_LEN, TAG, TAG_GSET, TAG_LEN,
-    free_slot, read_small, read_u64, same_elements, small_field, tagged_frame, write_into,
+    COUNT_LEN, FIELD_LEN, Merge, Refusal, SHAPE_LEN, TAG, TAG_GSET, TAG_LEN, fill_free, fits_free,
+    read_small, read_u64, same_elements, small_field, tagged_frame,
 };
 
 /// Where the shape sits in a frame.
@@ -16,17 +14,26 @@ const HELD: core::ops::Range<usize> = SHAPE.end..SHAPE.end + COUNT_LEN;
 /// Where the element records start in a frame.
 const RECORDS: usize = HELD.end;
 
+/// What an honoured [`GSet::insert`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inserting {
+    /// The element was not in the set and now is.
+    Inserted,
+    /// The element was already in the set; nothing changed.
+    Duplicate,
+}
+
 /// A set nothing is ever taken out of.
 ///
 /// ```
-/// use merge_machines::{GSet, Merge};
+/// use merge_machines::{GSet, Inserting, Merge};
 ///
 /// let mut left = GSet::<u16, 8>::new();
 /// let mut right = GSet::<u16, 8>::new();
 ///
-/// assert_eq!(left.insert(1), Ok(()));
-/// assert_eq!(left.insert(1), Ok(()));
-/// assert_eq!(right.insert(2), Ok(()));
+/// assert_eq!(left.insert(1), Ok(Inserting::Inserted));
+/// assert_eq!(left.insert(1), Ok(Inserting::Duplicate));
+/// assert_eq!(right.insert(2), Ok(Inserting::Inserted));
 ///
 /// assert_eq!(left.merge(&right), Ok(()));
 /// assert_eq!(left.len(), 2);
@@ -45,19 +52,20 @@ impl<T: Copy + PartialEq, const N: usize> GSet<T, N> {
         }
     }
 
-    /// Adds `element`, which is a no-op if it is already in.
+    /// Adds `element`. An element already in is an honoured repeat,
+    /// [`Inserting::Duplicate`], and changes nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`CapacityError`] when `element` is new and all `N` slots are
-    /// taken.
-    pub fn insert(&mut self, element: T) -> Result<(), CapacityError> {
+    /// [`Refusal::Full`] when `element` is new and all `N` slots are taken;
+    /// the set is unchanged.
+    pub fn insert(&mut self, element: T) -> Result<Inserting, Refusal> {
         if self.contains(&element) {
-            return Ok(());
+            return Ok(Inserting::Duplicate);
         }
-        let free = free_slot(&self.slots).ok_or(CapacityError)?;
-        self.slots[free] = Some(element);
-        Ok(())
+        let free = self.slots.iter_mut().find(|slot| slot.is_none());
+        *free.ok_or(Refusal::Full)? = Some(element);
+        Ok(Inserting::Inserted)
     }
 
     #[must_use]
@@ -85,22 +93,7 @@ impl<const N: usize> GSet<u64, N> {
     /// Length of the [`encode`](Self::encode) frame.
     pub const ENCODED_LEN: usize = RECORDS + N * FIELD_LEN;
 
-    /// Writes the set into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The set's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("set");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -119,10 +112,12 @@ impl<const N: usize> GSet<u64, N> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure, [`CodecError::Parameters`] when it was
-    /// written with another capacity.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure,
+    /// [`Refusal::WrongShape`] when it was written with another capacity,
+    /// [`Refusal::Malformed`] when it holds more records than slots or one
+    /// element twice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut set = Self::new();
         set.decode_into(bytes)?;
         Ok(set)
@@ -135,30 +130,49 @@ impl<const N: usize> GSet<u64, N> {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GSET)?;
         if read_small(&frame[SHAPE]) != N {
-            return Err(CodecError::Parameters);
+            return Err(Refusal::WrongShape);
         }
 
         let held = read_small(&frame[HELD]);
+        if held > N {
+            return Err(Refusal::Malformed);
+        }
         let (records, _) = frame[RECORDS..].as_chunks::<FIELD_LEN>();
 
-        self.slots = [None; N];
-        for (slot, record) in self.slots.iter_mut().zip(records.iter().take(held)) {
+        let mut set = Self::new();
+        for (slot, record) in set.slots.iter_mut().zip(records.iter().take(held)) {
             *slot = Some(read_u64(record));
         }
+        let repeated = |element: u64| set.iter().filter(|held| *held == element).count() > 1;
+        if set.iter().any(repeated) {
+            return Err(Refusal::Malformed);
+        }
+        *self = set;
         Ok(())
     }
 }
 
 impl<T: Copy + PartialEq, const N: usize> Merge for GSet<T, N> {
-    type Error = CapacityError;
+    type Error = Refusal;
 
+    /// # Errors
+    ///
+    /// [`Refusal::Full`] when the elements `other` holds and this set does not
+    /// outnumber the free slots. Checked before anything moves, so a refused
+    /// merge leaves the set exactly as it was.
     fn merge(&mut self, other: &Self) -> Result<(), Self::Error> {
-        for element in other.iter() {
-            self.insert(element)?;
+        let mut unseen = [false; N];
+        for (mark, slot) in unseen.iter_mut().zip(&other.slots) {
+            *mark = slot.is_some_and(|element| !self.contains(&element));
         }
+        if !fits_free(&self.slots, &unseen) {
+            return Err(Refusal::Full);
+        }
+
+        fill_free(&mut self.slots, &other.slots, &unseen);
         Ok(())
     }
 }

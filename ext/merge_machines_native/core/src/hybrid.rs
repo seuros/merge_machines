@@ -1,10 +1,7 @@
 //! A hybrid logical clock: timestamps near physical time that still order.
 
-#[cfg(feature = "alloc")]
-use crate::boxed_frame;
 use crate::{
-    ClockExhausted, CodecError, FIELD_LEN, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN,
-    read_u64, tagged_frame, write_into,
+    FIELD_LEN, Refusal, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN, read_u64, tagged_frame,
 };
 
 /// Bytes a [`HybridTimestamp`] occupies in a frame.
@@ -20,12 +17,26 @@ const COUNTER: core::ops::Range<usize> = FIELD_LEN..TIMESTAMP_LEN;
 const LAST: core::ops::Range<usize> = TAG_LEN..TAG_LEN + TIMESTAMP_LEN;
 
 /// A wall-clock reading paired with a counter that breaks its ties.
+///
+/// Both fields are protocol numbers every peer must read the same way, not
+/// handles to anything this crate holds. `wall_ns` is an event-time stamp in
+/// nanoseconds since the Unix epoch, not an instant on a monotonic clock, so
+/// it stays a `u64` rather than a `Duration`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HybridTimestamp {
     /// The wall-clock reading this was issued at, in nanoseconds.
     pub wall_ns: u64,
     /// How many timestamps have been issued at this reading.
     pub counter: u64,
+}
+
+impl HybridTimestamp {
+    /// The timestamp at reading `wall_ns` with tie-breaking `counter`. Every
+    /// pair is a valid timestamp.
+    #[must_use]
+    pub const fn new(wall_ns: u64, counter: u64) -> Self {
+        Self { wall_ns, counter }
+    }
 }
 
 impl Stamp for HybridTimestamp {
@@ -59,7 +70,7 @@ impl Stamp for HybridTimestamp {
 /// in here produces timestamps that no other machine can order against its own.
 ///
 /// ```
-/// use merge_machines::{ClockExhausted, HybridClock, HybridTimestamp};
+/// use merge_machines::{Refusal, HybridClock, HybridTimestamp};
 ///
 /// const MS: u64 = 1_000_000;
 /// let mut clock = HybridClock::new();
@@ -82,9 +93,9 @@ impl Stamp for HybridTimestamp {
 ///
 /// // A counter with nothing left reports it instead of repeating itself.
 /// let crowded = HybridTimestamp { wall_ns: 11 * MS, counter: u64::MAX };
-/// assert_eq!(clock.observe(0, crowded), Err(ClockExhausted));
+/// assert_eq!(clock.observe(0, crowded), Err(Refusal::Exhausted));
 /// assert_eq!(clock.last(), fourth);
-/// # Ok::<(), ClockExhausted>(())
+/// # Ok::<(), Refusal>(())
 /// ```
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HybridClock {
@@ -116,10 +127,10 @@ impl HybridClock {
     ///
     /// # Errors
     ///
-    /// [`ClockExhausted`] when the reading has not advanced and the counter
+    /// [`Refusal::Exhausted`] when the reading has not advanced and the counter
     /// that separates two events at the same reading holds its highest value,
     /// which leaves the clock where it was.
-    pub const fn tick(&mut self, wall_ns: u64) -> Result<HybridTimestamp, ClockExhausted> {
+    pub const fn tick(&mut self, wall_ns: u64) -> Result<HybridTimestamp, Refusal> {
         if wall_ns > self.last.wall_ns {
             self.last = HybridTimestamp {
                 wall_ns,
@@ -128,7 +139,7 @@ impl HybridClock {
             return Ok(self.last);
         }
         let Some(counter) = self.last.counter.checked_add(1) else {
-            return Err(ClockExhausted);
+            return Err(Refusal::Exhausted);
         };
         self.last.counter = counter;
         Ok(self.last)
@@ -144,7 +155,7 @@ impl HybridClock {
         &mut self,
         wall_ns: u64,
         observed: HybridTimestamp,
-    ) -> Result<HybridTimestamp, ClockExhausted> {
+    ) -> Result<HybridTimestamp, Refusal> {
         let latest = larger(wall_ns, larger(self.last.wall_ns, observed.wall_ns));
         let counter = if latest == self.last.wall_ns && latest == observed.wall_ns {
             larger(self.last.counter, observed.counter).checked_add(1)
@@ -156,7 +167,7 @@ impl HybridClock {
             Some(0)
         };
         let Some(counter) = counter else {
-            return Err(ClockExhausted);
+            return Err(Refusal::Exhausted);
         };
 
         self.last = HybridTimestamp {
@@ -169,22 +180,7 @@ impl HybridClock {
     /// Length of the [`encode`](Self::encode) frame.
     pub const ENCODED_LEN: usize = TAG_LEN + TIMESTAMP_LEN;
 
-    /// Writes the clock into `out`, returning the number of bytes written.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is shorter than
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        write_into(out, Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
-
-    /// The clock's frame, exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    #[cfg(feature = "alloc")]
-    #[must_use]
-    pub fn encoded(&self) -> alloc::boxed::Box<[u8]> {
-        boxed_frame(Self::ENCODED_LEN, |frame| self.write_frame(frame))
-    }
+    encoders!("clock");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
     fn write_frame(&self, frame: &mut [u8]) {
@@ -196,9 +192,9 @@ impl HybridClock {
     ///
     /// # Errors
     ///
-    /// [`CodecError::Truncated`] when `bytes` is too short, [`CodecError::Tag`]
-    /// when it holds another structure.
-    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+    /// [`Refusal::Truncated`] when `bytes` is too short,
+    /// [`Refusal::WrongStructure`] when it holds another structure.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         let mut clock = Self::new();
         clock.decode_into(bytes)?;
         Ok(clock)
@@ -211,7 +207,7 @@ impl HybridClock {
     /// # Errors
     ///
     /// The same as [`decode`](Self::decode).
-    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
         let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_HYBRID_CLOCK)?;
         self.last = HybridTimestamp::read(&frame[LAST]);
         Ok(())

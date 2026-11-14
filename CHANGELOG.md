@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/merge_machines/compare/merge_machines/v0.4.0...merge_machines/v0.5.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona 0.3: exact String frames, partner errors name the class
+
+### Features
+
+* adopt matryona 0.3: exact String frames, partner errors name the class ([2b0f45c](https://github.com/seuros/merge_machines/commit/2b0f45cfbbfb73bc279127e204bd276aa2724e60))
+
 ## [0.4.0](https://github.com/seuros/merge_machines/compare/merge_machines/v0.3.0...merge_machines/v0.4.0) (2026-11-14)
 
 

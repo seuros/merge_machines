@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/seuros/merge_machines/compare/merge_machines/v0.5.0...merge_machines/v0.5.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.4 ([39f27b4](https://github.com/seuros/merge_machines/commit/39f27b4800d2a7dd671fab0e33323e091a29c921))
+
 ## [0.5.0](https://github.com/seuros/merge_machines/compare/merge_machines/v0.4.0...merge_machines/v0.5.0) (2026-11-14)
 
 

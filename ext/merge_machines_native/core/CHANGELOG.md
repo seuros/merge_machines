@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/merge_machines/compare/merge-machines-v0.3.0...merge-machines-v0.4.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2: Refusal symbols! table, pinned state classes, exact-class merge partners, missing_docs
+
+### Features
+
+* adopt matryona-machines 0.2: Refusal symbols! table, pinned state classes, exact-class merge partners, missing_docs ([573e5da](https://github.com/seuros/merge_machines/commit/573e5dacfc881de79c94ae62c70d4ff9f811bca7))
+
 ## [0.3.0](https://github.com/seuros/merge_machines/compare/merge-machines-v0.2.0...merge-machines-v0.3.0) (2026-11-14)
 
 

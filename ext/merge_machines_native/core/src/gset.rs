@@ -45,6 +45,7 @@ pub struct GSet<T, const N: usize> {
 }
 
 impl<T: Copy + PartialEq, const N: usize> GSet<T, N> {
+    /// An empty set.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -68,16 +69,19 @@ impl<T: Copy + PartialEq, const N: usize> GSet<T, N> {
         Ok(Inserting::Inserted)
     }
 
+    /// Whether `element` was ever inserted.
     #[must_use]
     pub fn contains(&self, element: &T) -> bool {
         self.slots.iter().flatten().any(|held| held == element)
     }
 
+    /// How many elements the set holds.
     #[must_use]
     pub fn len(&self) -> usize {
         self.slots.iter().flatten().count()
     }
 
+    /// Whether the set holds no element.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

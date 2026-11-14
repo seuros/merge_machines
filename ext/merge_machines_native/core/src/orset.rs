@@ -122,6 +122,7 @@ pub struct OrSet<T, const N: usize> {
 }
 
 impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
+    /// An empty set with no add and no tombstone.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -167,6 +168,7 @@ impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
         answer
     }
 
+    /// Whether `element` has an add that is not tombstoned.
     #[must_use]
     pub fn contains(&self, element: &T) -> bool {
         self.live().any(|add| add.element == *element)
@@ -178,6 +180,7 @@ impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
         self.iter().count()
     }
 
+    /// Whether no element is live.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.live().next().is_none()

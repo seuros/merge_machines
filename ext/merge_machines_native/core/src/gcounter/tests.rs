@@ -1,4 +1,5 @@
 use crate::{GCounter, Merge, Refusal};
+use matryona_machines::testing::refuses;
 
 #[test]
 fn the_value_is_the_sum_of_every_replicas_count() {
@@ -61,9 +62,7 @@ fn an_unseen_replica_needs_a_free_slot() {
     assert_eq!(counter.increment(1, 1), Ok(()));
     assert_eq!(counter.increment(2, 1), Ok(()));
 
-    let before = counter;
-    assert_eq!(counter.increment(3, 1), Err(Refusal::Full));
-    assert_eq!(counter, before);
+    refuses(&mut counter, Refusal::Full, |c| c.increment(3, 1));
     assert_eq!(counter.increment(1, 1), Ok(()));
 }
 
@@ -72,9 +71,7 @@ fn a_count_that_would_pass_the_maximum_is_refused_whole() {
     let mut counter = GCounter::<2>::new();
     assert_eq!(counter.increment(1, u64::MAX - 1), Ok(()));
 
-    let before = counter;
-    assert_eq!(counter.increment(1, 2), Err(Refusal::Overflow));
-    assert_eq!(counter, before);
+    refuses(&mut counter, Refusal::Overflow, |c| c.increment(1, 2));
     assert_eq!(counter.count(1), u64::MAX - 1);
     assert_eq!(counter.increment(1, 1), Ok(()));
 }
@@ -99,12 +96,9 @@ fn a_refused_merge_raises_no_count_and_claims_no_slot() {
     assert_eq!(crowded.increment(3, 1), Ok(()));
     assert_eq!(crowded.increment(4, 1), Ok(()));
 
-    let before = left;
-    assert_eq!(left.merge(&crowded), Err(Refusal::Full));
-    assert_eq!(left, before);
+    refuses(&mut left, Refusal::Full, |l| l.merge(&crowded));
     let mut both = crowded;
-    assert_eq!(both.merge(&right), Err(Refusal::Full));
-    assert_eq!(both, crowded);
+    refuses(&mut both, Refusal::Full, |b| b.merge(&right));
     assert_eq!(both.count(1), 0, "the raise must not land without the slot");
 }
 

@@ -5,29 +5,39 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, IntoValue, RModule, RString, Ruby, Value, function, method, prelude::*};
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer, keep};
 use merge_machines::{HybridClock, HybridTimestamp, Refusal};
 
 use crate::data::{self, classes, timestamp_from};
-use crate::{Whole, on_copy, refusal, refused_frame};
+use crate::{refusal, refused_frame};
+
+/// `MergeMachines::HybridClock`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
 
 #[magnus::wrap(class = "MergeMachines::HybridClock", free_immediately, size)]
 struct Wrapper(RefCell<HybridClock>);
 
 /// The `Timestamp` issued, or the refusal's symbol. `classes` was looked up
-/// before the core was called, and the clock is a copy [`on_copy`] keeps only
+/// before the core was called, and the clock is a copy [`keep`] stores only
 /// once the value is built.
 fn stamped(
     ruby: &Ruby,
-    classes: data::Classes,
+    classes: &data::Classes,
     outcome: Result<HybridTimestamp, Refusal>,
 ) -> Result<Value, Error> {
     match outcome {
-        Ok(stamp) => data::timestamp(classes, stamp),
+        Ok(stamp) => data::timestamp(ruby, classes, stamp),
         Err(refused) => Ok(refusal(ruby, refused).into_value_with(ruby)),
     }
 }
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::HybridClock`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     const fn new() -> Self {
         Self(RefCell::new(HybridClock::new()))
     }
@@ -42,17 +52,22 @@ impl Wrapper {
 
     /// The last timestamp this clock issued.
     fn last(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
-        data::timestamp(classes(ruby)?, rb_self.0.borrow().last())
+        data::timestamp(ruby, classes(ruby)?, rb_self.0.borrow().last())
     }
 
     /// Stamps a local event at `wall_ns`: the `Timestamp` issued, or
     /// `:exhausted`.
-    fn tick(ruby: &Ruby, rb_self: Obj<Self>, Whole(wall_ns): Whole<u64>) -> Result<Value, Error> {
+    fn tick(ruby: &Ruby, rb_self: Obj<Self>, wall_ns: Value) -> Result<Value, Error> {
         rb_self.check_frozen()?;
+        let wall_ns: u64 = integer(wall_ns, "wall_ns")?;
         let classes = classes(ruby)?;
-        on_copy(ruby, rb_self, &rb_self.0, |clock| {
-            stamped(ruby, classes, clock.tick(wall_ns))
-        })
+        keep(
+            ruby,
+            rb_self,
+            &rb_self.0,
+            |clock| clock.tick(wall_ns),
+            |outcome| stamped(ruby, classes, outcome),
+        )
     }
 
     /// Stamps the receipt of `observed` at `wall_ns`: the `Timestamp` issued,
@@ -60,19 +75,24 @@ impl Wrapper {
     fn observe(
         ruby: &Ruby,
         rb_self: Obj<Self>,
-        Whole(wall_ns): Whole<u64>,
+        wall_ns: Value,
         observed: Value,
     ) -> Result<Value, Error> {
         rb_self.check_frozen()?;
+        let wall_ns: u64 = integer(wall_ns, "wall_ns")?;
         let classes = classes(ruby)?;
         let observed = timestamp_from(ruby, observed)?;
-        on_copy(ruby, rb_self, &rb_self.0, |clock| {
-            stamped(ruby, classes, clock.observe(wall_ns, observed))
-        })
+        keep(
+            ruby,
+            rb_self,
+            &rb_self.0,
+            |clock| clock.observe(wall_ns, observed),
+            |outcome| stamped(ruby, classes, outcome),
+        )
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| *self.0.borrow() == *other.0.borrow())
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
     }
 
     /// `HybridClock::encoded`.
@@ -91,6 +111,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("HybridClock", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 0))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

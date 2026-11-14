@@ -107,6 +107,7 @@ const fn larger(left: u64, right: u64) -> u64 {
 }
 
 impl HybridClock {
+    /// A clock that has issued nothing: its last timestamp is `(0, 0)`.
     #[must_use]
     pub const fn new() -> Self {
         Self {

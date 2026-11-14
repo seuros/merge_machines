@@ -4,10 +4,11 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
 use merge_machines::{PNCounter, ReplicaId};
 
 use crate::shape::shaped;
-use crate::{Whole, expected, merged, unit};
+use crate::{merged, unit};
 
 /// The counter at a single replica count.
 type Held<const R: usize> = PNCounter<R>;
@@ -26,6 +27,9 @@ macro_rules! counter {
     };
 }
 
+/// `MergeMachines::PNCounter`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
+
 #[magnus::wrap(class = "MergeMachines::PNCounter", free_immediately, size)]
 struct Wrapper(RefCell<Counter>);
 
@@ -34,8 +38,15 @@ const fn replicas_of<const R: usize>(_: &Held<R>) -> usize {
 }
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::PNCounter`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     /// `PNCounter::<replicas>::new()`.
-    fn new(ruby: &Ruby, Whole(replicas): Whole<usize>) -> Result<Self, Error> {
+    fn new(ruby: &Ruby, replicas: Value) -> Result<Self, Error> {
+        let replicas: usize = integer(replicas, "replicas")?;
         Counter::blank(ruby, replicas).map(|held| Self(RefCell::new(held)))
     }
 
@@ -52,10 +63,12 @@ impl Wrapper {
     fn increment(
         ruby: &Ruby,
         rb_self: Obj<Self>,
-        Whole(replica): Whole<ReplicaId>,
-        Whole(by): Whole<u64>,
+        replica: Value,
+        by: Value,
     ) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let replica: ReplicaId = integer(replica, "replica")?;
+        let by: u64 = integer(by, "by")?;
         let outcome = counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
             .increment(replica, by));
         Ok(unit(ruby, outcome, "incremented"))
@@ -64,10 +77,12 @@ impl Wrapper {
     fn decrement(
         ruby: &Ruby,
         rb_self: Obj<Self>,
-        Whole(replica): Whole<ReplicaId>,
-        Whole(by): Whole<u64>,
+        replica: Value,
+        by: Value,
     ) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let replica: ReplicaId = integer(replica, "replica")?;
+        let by: u64 = integer(by, "by")?;
         let outcome = counter!(&mut *rb_self.0.borrow_mut(), |counter| counter
             .decrement(replica, by));
         Ok(unit(ruby, outcome, "decremented"))
@@ -87,9 +102,10 @@ impl Wrapper {
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = <&Self>::try_convert(other)
-            .map(|other| other.0.borrow().clone())
-            .map_err(|_| expected(ruby, "a MergeMachines::PNCounter", other))?;
+        let source = Self::exact(ruby, other, "expected a MergeMachines::PNCounter")?
+            .0
+            .borrow()
+            .clone();
         let outcome = rb_self.0.borrow_mut().absorb(&source);
         merged(
             ruby,
@@ -99,8 +115,8 @@ impl Wrapper {
         )
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| self.0.borrow().same(&other.0.borrow()))
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
     }
 
     /// `PNCounter::encoded`.
@@ -120,6 +136,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("PNCounter", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 1))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

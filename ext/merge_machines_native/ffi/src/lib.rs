@@ -13,71 +13,42 @@ mod data;
 mod gcounter;
 mod gset;
 mod hybrid;
+mod init;
 mod logical;
 mod lww;
 mod orset;
 mod pncounter;
 mod shape;
 
-use std::cell::RefCell;
-
-use magnus::rb_sys::AsRawValue;
-use magnus::value::ReprValue;
-use magnus::{Error, Integer, RClass, Ruby, Symbol, TryConvert, Value};
+use magnus::{Error, Ruby, Symbol, Value, prelude::*};
+use matryona_machines::ruby::{Symbols, symbol};
 use merge_machines::Refusal;
 
 /// Where a core frame names the shape it was written at.
 pub(crate) const SHAPE: core::ops::Range<usize> = 1..3;
 
-/// A whole number of things: a replica, an element, a stamp, a capacity, a
-/// count, a nanosecond reading.
-///
-/// magnus reads an integer through Ruby's `NUM2*` family, which truncates a
-/// `Float` towards zero instead of refusing it, so an argument that means an
-/// integer is read as one of these and anything but an `Integer` is a
-/// `TypeError`. An `Integer` outside the target width, negative ones included,
-/// is the `RangeError` magnus raises for it.
-pub(crate) struct Whole<T>(pub(crate) T);
-
-impl<T: TryConvert> TryConvert for Whole<T> {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        if Integer::from_value(value).is_none() {
-            let ruby = Ruby::get_with(value);
-            return Err(Error::new(
-                ruby.exception_type_error(),
-                format!(
-                    "no implicit conversion of {} into Integer: {}",
-                    value.class(),
-                    value.inspect()
-                ),
-            ));
-        }
-        T::try_convert(value).map(Self)
-    }
-}
-
-/// The symbol a refusal comes back to Ruby as.
-pub(crate) const fn refusal_name(refusal: Refusal) -> &'static str {
-    match refusal {
-        Refusal::Full => "full",
-        Refusal::Overflow => "overflow",
-        Refusal::Exhausted => "exhausted",
-        Refusal::Mismatch => "mismatch",
-        Refusal::Truncated => "truncated",
-        Refusal::WrongStructure => "wrong_structure",
-        Refusal::WrongShape => "wrong_shape",
-        Refusal::Malformed => "malformed",
+matryona_machines::symbols! {
+    /// The symbol each refusal comes back to Ruby as.
+    pub(crate) Refusals for Refusal as "a refusal" {
+        Full => "full",
+        Overflow => "overflow",
+        Exhausted => "exhausted",
+        Mismatch => "mismatch",
+        Truncated => "truncated",
+        WrongStructure => "wrong_structure",
+        WrongShape => "wrong_shape",
+        Malformed => "malformed",
     }
 }
 
 pub(crate) fn refusal(ruby: &Ruby, refusal: Refusal) -> Symbol {
-    ruby.to_symbol(refusal_name(refusal))
+    Refusals::symbol(ruby, refusal)
 }
 
 /// `honoured` for an honoured unit answer, the refusal's symbol otherwise.
 pub(crate) fn unit(ruby: &Ruby, outcome: Result<(), Refusal>, honoured: &str) -> Symbol {
     match outcome {
-        Ok(()) => ruby.to_symbol(honoured),
+        Ok(()) => symbol(ruby, honoured),
         Err(refused) => refusal(ruby, refused),
     }
 }
@@ -95,48 +66,11 @@ pub(crate) fn merged(
         .ok_or_else(|| expected(ruby, what, other))
 }
 
-/// Runs `act` on a copy of the state in `cell` and keeps the copy only once
-/// `act`, which builds the answer and may run Ruby, has returned. A raise
-/// while building leaves the state as it was, so no work is lost. Right
-/// before the store the receiver is checked again: frozen meanwhile (a
-/// redefined `new` freezing it) raises `FrozenError`, changed meanwhile (a
-/// redefined `new` calling back in) raises `RuntimeError`, and in both cases
-/// the copy is not applied.
-pub(crate) fn on_copy<T: Clone + PartialEq, R>(
-    ruby: &Ruby,
-    receiver: impl ReprValue,
-    cell: &RefCell<T>,
-    act: impl FnOnce(&mut T) -> Result<R, Error>,
-) -> Result<R, Error> {
-    receiver.check_frozen()?;
-    let before = cell.borrow().clone();
-    let mut after = before.clone();
-    let answer = act(&mut after)?;
-    receiver.check_frozen()?;
-    let mut held = cell.borrow_mut();
-    if *held != before {
-        return Err(Error::new(
-            ruby.exception_runtime_error(),
-            "the state changed while the answer was built; the call was not applied",
-        ));
-    }
-    *held = after;
-    Ok(answer)
-}
-
-/// Whether `value` is an instance of exactly `class`: the classes compared by
-/// identity, which no Ruby method can be redefined to fake. A subclass (whose
-/// constant leaks past the seal) is refused, and so is a value given a
-/// singleton class.
-pub(crate) fn instance_of(value: Value, class: RClass) -> bool {
-    value.class().as_raw() == class.as_raw()
-}
-
 /// The `RangeError` for a frame `decode` turned down.
 pub(crate) fn refused_frame(ruby: &Ruby, refused: Refusal) -> Error {
     Error::new(
         ruby.exception_range_error(),
-        format!("the frame is refused: {}", refusal_name(refused)),
+        format!("the frame is refused: {}", Refusals::name(refused)),
     )
 }
 
@@ -157,28 +91,10 @@ pub(crate) fn unsupported(ruby: &Ruby, name: &str, given: usize, supported: &[us
 
 /// The `TypeError` for an argument of the wrong class.
 pub(crate) fn expected(ruby: &Ruby, what: &str, given: Value) -> Error {
-    Error::new(
-        ruby.exception_type_error(),
-        format!("expected {what}, got {}", given.inspect()),
-    )
+    Error::new(ruby.exception_type_error(), expected_message(what, given))
 }
 
-pub(crate) fn uninitialised(ruby: &Ruby) -> Error {
-    Error::new(
-        ruby.exception_load_error(),
-        "the merge_machines extension is not initialised",
-    )
-}
-
-#[magnus::init]
-fn init(ruby: &Ruby) -> Result<(), Error> {
-    let module = ruby.define_module("MergeMachines")?;
-    data::define(ruby, module)?;
-    logical::define(ruby, module)?;
-    hybrid::define(ruby, module)?;
-    gcounter::define(ruby, module)?;
-    pncounter::define(ruby, module)?;
-    lww::define(ruby, module)?;
-    gset::define(ruby, module)?;
-    orset::define(ruby, module)
+/// What [`expected`] says, for a reader that builds its own `TypeError`.
+pub(crate) fn expected_message(what: &str, given: Value) -> String {
+    format!("expected {what}, got {}", given.inspect())
 }

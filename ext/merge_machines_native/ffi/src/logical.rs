@@ -4,9 +4,13 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, IntoValue, RModule, RString, Ruby, Value, function, method, prelude::*};
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
 use merge_machines::{LogicalClock, Refusal};
 
-use crate::{Whole, refusal, refused_frame};
+use crate::{refusal, refused_frame};
+
+/// `MergeMachines::LogicalClock`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
 
 #[magnus::wrap(class = "MergeMachines::LogicalClock", free_immediately, size)]
 struct Wrapper(RefCell<LogicalClock>);
@@ -20,6 +24,12 @@ fn stamped(ruby: &Ruby, outcome: Result<u64, Refusal>) -> Value {
 }
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::LogicalClock`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     const fn new() -> Self {
         Self(RefCell::new(LogicalClock::new()))
     }
@@ -45,18 +55,15 @@ impl Wrapper {
     }
 
     /// The stamp issued, or `:exhausted`.
-    fn observe(
-        ruby: &Ruby,
-        rb_self: Obj<Self>,
-        Whole(observed): Whole<u64>,
-    ) -> Result<Value, Error> {
+    fn observe(ruby: &Ruby, rb_self: Obj<Self>, observed: Value) -> Result<Value, Error> {
         rb_self.check_frozen()?;
+        let observed: u64 = integer(observed, "observed")?;
         let outcome = rb_self.0.borrow_mut().observe(observed);
         Ok(stamped(ruby, outcome))
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| *self.0.borrow() == *other.0.borrow())
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
     }
 
     /// `LogicalClock::encoded`.
@@ -71,6 +78,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("LogicalClock", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 0))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

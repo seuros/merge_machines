@@ -1,4 +1,5 @@
 use crate::{HybridTimestamp, LwwRegister, Merge, Refusal, Writing};
+use matryona_machines::testing::refuses;
 
 /// The later stamp wins, and an equal stamp is broken by the higher replica,
 /// the same way whichever side merges.
@@ -85,7 +86,6 @@ fn a_merge_of_two_values_under_one_stamp_is_refused() {
     let right = LwwRegister::new(9_u32, 5_u64, 2);
     let before = left;
 
-    assert_eq!(left.merge(&right), Err(Refusal::Mismatch));
-    assert_eq!(left, before);
+    refuses(&mut left, Refusal::Mismatch, |l| l.merge(&right));
     assert_eq!(left.merge(&before), Ok(()));
 }

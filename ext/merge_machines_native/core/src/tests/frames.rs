@@ -5,6 +5,8 @@
 
 use core::fmt::Debug;
 
+use matryona_machines::testing::refuses;
+
 use crate::{
     Adding, GCounter, GSet, HybridClock, HybridTimestamp, Inserting, LogicalClock, LwwRegister,
     OrSet, PNCounter, Refusal, Removing, TAG, Tag,
@@ -87,9 +89,7 @@ fn assert_contract<S: Framed>(state: &S, foreign: u8) {
         (&other[..S::LEN], Refusal::WrongStructure),
     ] {
         assert_eq!(S::decode(bytes), Err(refusal), "{name}");
-        let mut held = state.clone();
-        assert_eq!(held.decode_into(bytes), Err(refusal), "{name}");
-        assert_eq!(&held, state, "{name}: a refused frame moved the state");
+        refuses(&mut state.clone(), refusal, |held| held.decode_into(bytes));
     }
 }
 

@@ -20,5 +20,8 @@ default = []
 std = ["alloc"]
 alloc = []
 
+[dev-dependencies]
+matryona-machines = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

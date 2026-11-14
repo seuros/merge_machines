@@ -5,10 +5,11 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
 use merge_machines::{GSet, Inserting};
 
 use crate::shape::shaped;
-use crate::{Whole, expected, merged, refusal};
+use crate::{merged, refusal};
 
 /// The set at a single capacity, over the 64-bit elements a frame carries.
 type Held<const N: usize> = GSet<u64, N>;
@@ -26,6 +27,9 @@ macro_rules! set {
     };
 }
 
+/// `MergeMachines::GSet`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
+
 #[magnus::wrap(class = "MergeMachines::GSet", free_immediately, size)]
 struct Wrapper(RefCell<Set>);
 
@@ -34,8 +38,15 @@ const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
 }
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::GSet`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     /// `GSet::<u64, capacity>::new()`.
-    fn new(ruby: &Ruby, Whole(capacity): Whole<usize>) -> Result<Self, Error> {
+    fn new(ruby: &Ruby, capacity: Value) -> Result<Self, Error> {
+        let capacity: usize = integer(capacity, "capacity")?;
         Set::blank(ruby, capacity).map(|held| Self(RefCell::new(held)))
     }
 
@@ -50,12 +61,9 @@ impl Wrapper {
     }
 
     /// `:inserted`, `:duplicate` or `:full`.
-    fn insert(
-        ruby: &Ruby,
-        rb_self: Obj<Self>,
-        Whole(element): Whole<u64>,
-    ) -> Result<Symbol, Error> {
+    fn insert(ruby: &Ruby, rb_self: Obj<Self>, element: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let element: u64 = integer(element, "element")?;
         let outcome = set!(&mut *rb_self.0.borrow_mut(), |set| set.insert(element));
         Ok(match outcome {
             Ok(Inserting::Inserted) => ruby.to_symbol("inserted"),
@@ -64,8 +72,9 @@ impl Wrapper {
         })
     }
 
-    fn includes(&self, Whole(element): Whole<u64>) -> bool {
-        set!(&*self.0.borrow(), |set| set.contains(&element))
+    fn includes(&self, element: Value) -> Result<bool, Error> {
+        let element: u64 = integer(element, "element")?;
+        Ok(set!(&*self.0.borrow(), |set| set.contains(&element)))
     }
 
     /// `GSet::iter`, collected.
@@ -83,15 +92,16 @@ impl Wrapper {
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = <&Self>::try_convert(other)
-            .map(|other| other.0.borrow().clone())
-            .map_err(|_| expected(ruby, "a MergeMachines::GSet", other))?;
+        let source = Self::exact(ruby, other, "expected a MergeMachines::GSet")?
+            .0
+            .borrow()
+            .clone();
         let outcome = rb_self.0.borrow_mut().absorb(&source);
         merged(ruby, outcome, other, "a GSet of the same capacity")
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| self.0.borrow().same(&other.0.borrow()))
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
     }
 
     /// `GSet::encoded`.
@@ -111,6 +121,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("GSet", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 1))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

@@ -67,6 +67,7 @@ pub struct GCounter<const R: usize> {
 }
 
 impl<const R: usize> GCounter<R> {
+    /// A counter at zero on every replica.
     #[must_use]
     pub const fn new() -> Self {
         Self { slots: [None; R] }

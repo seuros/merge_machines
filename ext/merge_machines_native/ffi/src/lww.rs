@@ -12,12 +12,13 @@ use magnus::typed_data::Obj;
 use magnus::{
     Error, Integer, IntoValue, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*,
 };
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
 use merge_machines::{
     HybridTimestamp, LwwRegister, Merge, Refusal, ReplicaId, STAMP_HYBRID, STAMP_LOGICAL, Writing,
 };
 
 use crate::data::{self, classes, timestamp_from};
-use crate::{SHAPE, Whole, expected, merged, refusal, refused_frame};
+use crate::{SHAPE, expected, merged, refusal, refused_frame};
 
 /// A register stamped by one of the two clocks.
 #[derive(Clone, PartialEq, Eq)]
@@ -35,23 +36,28 @@ enum Stamped {
 /// An Integer stamp or a `MergeMachines::Timestamp`.
 fn stamp_from(ruby: &Ruby, value: Value) -> Result<Stamped, Error> {
     if Integer::from_value(value).is_some() {
-        let Whole(stamp) = Whole::<u64>::try_convert(value)?;
-        return Ok(Stamped::Logical(stamp));
+        return integer(value, "stamp").map(Stamped::Logical);
     }
     timestamp_from(ruby, value).map(Stamped::Hybrid)
 }
+
+/// `MergeMachines::LwwRegister`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
 
 #[magnus::wrap(class = "MergeMachines::LwwRegister", free_immediately, size)]
 struct Wrapper(RefCell<Register>);
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::LwwRegister`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     /// `LwwRegister::new(value, stamp, replica)`, of the kind `stamp` is.
-    fn new(
-        ruby: &Ruby,
-        Whole(value): Whole<u64>,
-        stamp: Value,
-        Whole(replica): Whole<ReplicaId>,
-    ) -> Result<Self, Error> {
+    fn new(ruby: &Ruby, value: Value, stamp: Value, replica: Value) -> Result<Self, Error> {
+        let value: u64 = integer(value, "value")?;
+        let replica: ReplicaId = integer(replica, "replica")?;
         let register = match stamp_from(ruby, stamp)? {
             Stamped::Logical(stamp) => Register::Logical(LwwRegister::new(value, stamp, replica)),
             Stamped::Hybrid(stamp) => Register::Hybrid(LwwRegister::new(value, stamp, replica)),
@@ -80,11 +86,13 @@ impl Wrapper {
     fn set(
         ruby: &Ruby,
         rb_self: Obj<Self>,
-        Whole(value): Whole<u64>,
+        value: Value,
         stamp: Value,
-        Whole(replica): Whole<ReplicaId>,
+        replica: Value,
     ) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let value: u64 = integer(value, "value")?;
+        let replica: ReplicaId = integer(replica, "replica")?;
         let given = stamp_from(ruby, stamp)?;
         let outcome = match (&mut *rb_self.0.borrow_mut(), given) {
             (Register::Logical(held), Stamped::Logical(stamp)) => {
@@ -114,7 +122,7 @@ impl Wrapper {
     fn stamp(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         match &*rb_self.0.borrow() {
             Register::Logical(register) => Ok(register.stamp().into_value_with(ruby)),
-            Register::Hybrid(register) => data::timestamp(classes(ruby)?, *register.stamp()),
+            Register::Hybrid(register) => data::timestamp(ruby, classes(ruby)?, *register.stamp()),
         }
     }
 
@@ -129,9 +137,10 @@ impl Wrapper {
     /// once this one's borrow has ended: naming it runs `other.inspect`.
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = <&Self>::try_convert(other)
-            .map(|other| other.0.borrow().clone())
-            .map_err(|_| expected(ruby, "a MergeMachines::LwwRegister", other))?;
+        let source = Self::exact(ruby, other, "expected a MergeMachines::LwwRegister")?
+            .0
+            .borrow()
+            .clone();
         let outcome = match (&mut *rb_self.0.borrow_mut(), &source) {
             (Register::Logical(held), Register::Logical(theirs)) => Some(held.merge(theirs)),
             (Register::Hybrid(held), Register::Hybrid(theirs)) => Some(held.merge(theirs)),
@@ -141,8 +150,8 @@ impl Wrapper {
         merged(ruby, outcome, other, "a register of the same kind of stamp")
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| *self.0.borrow() == *other.0.borrow())
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
     }
 
     /// `LwwRegister::encoded`.
@@ -165,6 +174,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("LwwRegister", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 3))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

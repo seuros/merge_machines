@@ -1,13 +1,15 @@
 use crate::{GSet, Inserting, Merge, Refusal};
+use matryona_machines::testing::{refuses, unchanged};
 
 #[test]
 fn inserting_the_same_element_twice_changes_nothing() {
     let mut set = GSet::<u8, 4>::new();
 
     assert_eq!(set.insert(3), Ok(Inserting::Inserted));
-    let before = set;
-    assert_eq!(set.insert(3), Ok(Inserting::Duplicate));
-    assert_eq!(set, before);
+    assert_eq!(
+        unchanged(&mut set, |s| s.insert(3)),
+        Ok(Inserting::Duplicate)
+    );
 
     assert_eq!(set.len(), 1);
     assert!(set.contains(&3));
@@ -64,9 +66,7 @@ fn a_new_element_needs_a_free_slot() {
     assert_eq!(set.insert(1), Ok(Inserting::Inserted));
     assert_eq!(set.insert(2), Ok(Inserting::Inserted));
 
-    let before = set;
-    assert_eq!(set.insert(3), Err(Refusal::Full));
-    assert_eq!(set, before);
+    refuses(&mut set, Refusal::Full, |s| s.insert(3));
     assert_eq!(set.insert(1), Ok(Inserting::Duplicate));
 }
 
@@ -78,9 +78,7 @@ fn a_refused_merge_lands_nothing() {
     assert_eq!(right.insert(2), Ok(Inserting::Inserted));
     assert_eq!(right.insert(3), Ok(Inserting::Inserted));
 
-    let before = left;
-    assert_eq!(left.merge(&right), Err(Refusal::Full));
-    assert_eq!(left, before);
+    refuses(&mut left, Refusal::Full, |l| l.merge(&right));
 }
 
 #[test]

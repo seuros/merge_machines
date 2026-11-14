@@ -32,6 +32,7 @@ pub struct PNCounter<const R: usize> {
 }
 
 impl<const R: usize> PNCounter<R> {
+    /// A counter at zero on every replica.
     #[must_use]
     pub const fn new() -> Self {
         Self {

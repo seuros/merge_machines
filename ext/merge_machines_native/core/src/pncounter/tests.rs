@@ -1,4 +1,5 @@
 use crate::{Merge, PNCounter, Refusal};
+use matryona_machines::testing::refuses;
 
 #[test]
 fn the_value_is_what_was_added_minus_what_was_taken() {
@@ -82,9 +83,7 @@ fn a_refused_merge_moves_neither_side() {
     assert_eq!(right.increment(2, 5), Ok(()));
     assert_eq!(right.decrement(2, 5), Ok(()));
 
-    let before = left;
-    assert_eq!(left.merge(&right), Err(Refusal::Full));
-    assert_eq!(left, before);
+    refuses(&mut left, Refusal::Full, |l| l.merge(&right));
     assert_eq!(left.added(), 0, "the side with room must not take its half");
 }
 
@@ -92,11 +91,9 @@ fn a_refused_merge_moves_neither_side() {
 fn a_refused_step_changes_nothing() {
     let mut counter = PNCounter::<1>::new();
     assert_eq!(counter.increment(1, u64::MAX), Ok(()));
-    let before = counter;
 
-    assert_eq!(counter.increment(1, 1), Err(Refusal::Overflow));
-    assert_eq!(counter.increment(2, 1), Err(Refusal::Full));
-    assert_eq!(counter, before);
+    refuses(&mut counter, Refusal::Overflow, |c| c.increment(1, 1));
+    refuses(&mut counter, Refusal::Full, |c| c.increment(2, 1));
     assert_eq!(counter.decrement(1, 1), Ok(()));
     assert_eq!(counter.decrement(2, 1), Err(Refusal::Full));
 }

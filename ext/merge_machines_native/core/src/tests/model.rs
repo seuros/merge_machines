@@ -2,6 +2,8 @@
 //! refusal and each honoured repeat is checked against a clone taken before
 //! the call: it must have changed nothing.
 
+use matryona_machines::testing::XorShift64 as Draw;
+
 use crate::{
     Adding, GCounter, GSet, HybridClock, HybridTimestamp, Inserting, LogicalClock, LwwRegister,
     Merge, OrSet, PNCounter, Refusal, Removing, Tag, Writing,
@@ -22,25 +24,20 @@ const STEPS: usize = 600;
 /// Seeds per structure.
 const SEEDS: [u64; 4] = [1, 0x9E37_79B9, 0xDEAD_BEEF, 0x1234_5678_9ABC];
 
-/// A xorshift generator: deterministic, allocation-free, good enough to mix.
-struct Draw(u64);
+/// What a run draws besides `XorShift64`'s own `below`: an index into a
+/// table, and a small set element.
+trait Draws {
+    fn index(&mut self, bound: usize) -> usize;
+    fn byte(&mut self, bound: u8) -> u8;
+}
 
-impl Draw {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+impl Draws for Draw {
+    fn index(&mut self, bound: usize) -> usize {
+        usize::try_from(self.below(bound as u64)).unwrap_or(0)
     }
 
-    /// A number below `bound`.
-    fn below(&mut self, bound: usize) -> usize {
-        usize::try_from(self.next() % bound as u64).unwrap_or(0)
-    }
-
-    /// A small number below `bound`, as a set element.
     fn byte(&mut self, bound: u8) -> u8 {
-        u8::try_from(self.next() % u64::from(bound)).unwrap_or(0)
+        u8::try_from(self.below(u64::from(bound))).unwrap_or(0)
     }
 }
 
@@ -49,7 +46,7 @@ fn amount(draw: &mut Draw) -> u64 {
     match draw.below(8) {
         0 => 0,
         1 => u64::MAX / 2,
-        _ => draw.next() % 10,
+        _ => draw.next_u64() % 10,
     }
 }
 
@@ -95,13 +92,13 @@ fn assert_counts(counter: &GCounter<3>, counts: &Counts) {
 #[test]
 fn gcounter_and_pncounter_follow_the_model() {
     for seed in SEEDS {
-        let mut draw = Draw(seed);
+        let mut draw = Draw::new(seed);
         let mut states = [GCounter::<3>::new(); 3];
         let mut models = [[None; IDS]; 3];
         let mut pn = [PNCounter::<3>::new(); 2];
         for _ in 0..STEPS {
-            let (at, from) = (draw.below(3), draw.below(3));
-            let replica = draw.below(IDS);
+            let (at, from) = (draw.index(3), draw.index(3));
+            let replica = draw.index(IDS);
             let before = states[at];
             let (answer, expected) = if draw.below(3) == 0 {
                 let source = states[from];
@@ -139,11 +136,11 @@ fn gcounter_and_pncounter_follow_the_model() {
 #[test]
 fn gset_follows_the_model() {
     for seed in SEEDS {
-        let mut draw = Draw(seed);
+        let mut draw = Draw::new(seed);
         let mut states = [GSet::<u8, 3>::new(); 3];
         let mut models = [[false; ELEMENTS as usize]; 3];
         for _ in 0..STEPS {
-            let (at, from) = (draw.below(3), draw.below(3));
+            let (at, from) = (draw.index(3), draw.index(3));
             let before = states[at];
             if draw.below(3) == 0 {
                 let source = states[from];
@@ -231,7 +228,7 @@ fn orset_step(
             expected == Removing::Removed
         }
         _ => {
-            let (replica, counter) = (draw.below(IDS), draw.below(COUNTERS));
+            let (replica, counter) = (draw.index(IDS), draw.index(COUNTERS));
             let element = draw.byte(ELEMENTS);
             let expected = match (model[replica][counter], held) {
                 (Some((added, _)), _) if added == element => Ok(Adding::Duplicate),
@@ -265,11 +262,11 @@ fn orset_step(
 #[test]
 fn orset_follows_the_model() {
     for seed in SEEDS {
-        let mut draw = Draw(seed);
+        let mut draw = Draw::new(seed);
         let mut states = [OrSet::<u8, 3>::new(); 3];
         let mut models: [Tags; 3] = [[[None; COUNTERS]; IDS]; 3];
         for _ in 0..STEPS {
-            let (at, from) = (draw.below(3), draw.below(3));
+            let (at, from) = (draw.index(3), draw.index(3));
             let (source, known) = (states[from], models[from]);
             orset_step(
                 &mut draw,
@@ -284,13 +281,13 @@ fn orset_follows_the_model() {
 #[test]
 fn lww_register_follows_the_model() {
     for seed in SEEDS {
-        let mut draw = Draw(seed);
+        let mut draw = Draw::new(seed);
         let mut states = [LwwRegister::new(0_u8, 0_u64, 0); 3];
         for _ in 0..STEPS {
-            let (at, from) = (draw.below(3), draw.below(3));
+            let (at, from) = (draw.index(3), draw.index(3));
             let before = states[at];
             let held = (*before.stamp(), before.replica(), *before.value());
-            let (stamp, replica) = (draw.next() % 6, draw.next() % 3);
+            let (stamp, replica) = (draw.next_u64() % 6, draw.next_u64() % 3);
             let value = if draw.below(2) == 0 {
                 held.2
             } else {
@@ -330,11 +327,11 @@ fn lww_register_follows_the_model() {
 #[test]
 fn clocks_refuse_without_moving() {
     for seed in SEEDS {
-        let mut draw = Draw(seed);
+        let mut draw = Draw::new(seed);
         let mut logical = LogicalClock::new();
         let mut hybrid = HybridClock::new();
         for _ in 0..STEPS {
-            let near_top = u64::MAX - (draw.next() % 4);
+            let near_top = u64::MAX - (draw.next_u64() % 4);
             let before = logical;
             let answer = if draw.below(2) == 0 {
                 logical.tick()
@@ -342,7 +339,7 @@ fn clocks_refuse_without_moving() {
                 logical.observe(if draw.below(4) == 0 {
                     near_top
                 } else {
-                    draw.next() % 50
+                    draw.next_u64() % 50
                 })
             };
             match answer {
@@ -354,8 +351,8 @@ fn clocks_refuse_without_moving() {
             }
 
             let before = hybrid;
-            let wall_ns = draw.next() % 8;
-            let observed = HybridTimestamp::new(draw.next() % 8, near_top);
+            let wall_ns = draw.next_u64() % 8;
+            let observed = HybridTimestamp::new(draw.next_u64() % 8, near_top);
             let answer = if draw.below(2) == 0 {
                 hybrid.tick(wall_ns)
             } else {

@@ -6,11 +6,12 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, RArray, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
+use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
 use merge_machines::{Adding, OrSet, Removing, Tag, Tagged};
 
 use crate::data::{self, classes, tag_from};
 use crate::shape::shaped;
-use crate::{Whole, expected, merged, refusal};
+use crate::{merged, refusal};
 
 /// The set at a single capacity, over the 64-bit elements a frame carries.
 type Held<const N: usize> = OrSet<u64, N>;
@@ -28,6 +29,9 @@ macro_rules! set {
     };
 }
 
+/// `MergeMachines::OrSet`, pinned when [`define`] creates it.
+static CLASS: Registry<Class> = Registry::new("merge_machines");
+
 #[magnus::wrap(class = "MergeMachines::OrSet", free_immediately, size)]
 struct Wrapper(RefCell<Set>);
 
@@ -36,8 +40,15 @@ const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
 }
 
 impl Wrapper {
+    /// `value` as exactly a `MergeMachines::OrSet`: `TypeError` with `message`
+    /// for anything else, a subclass instance included.
+    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
+        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    }
+
     /// `OrSet::<u64, capacity>::new()`.
-    fn new(ruby: &Ruby, Whole(capacity): Whole<usize>) -> Result<Self, Error> {
+    fn new(ruby: &Ruby, capacity: Value) -> Result<Self, Error> {
+        let capacity: usize = integer(capacity, "capacity")?;
         Set::blank(ruby, capacity).map(|held| Self(RefCell::new(held)))
     }
 
@@ -53,13 +64,9 @@ impl Wrapper {
 
     /// `:added`, `:duplicate`, `:full` or `:mismatch`. The tag is read before
     /// the core is called.
-    fn add(
-        ruby: &Ruby,
-        rb_self: Obj<Self>,
-        Whole(element): Whole<u64>,
-        tag: Value,
-    ) -> Result<Symbol, Error> {
+    fn add(ruby: &Ruby, rb_self: Obj<Self>, element: Value, tag: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let element: u64 = integer(element, "element")?;
         let tag = tag_from(ruby, tag)?;
         let outcome = set!(&mut *rb_self.0.borrow_mut(), |set| set.add(element, tag));
         Ok(match outcome {
@@ -70,12 +77,9 @@ impl Wrapper {
     }
 
     /// `:removed` or `:not_held`.
-    fn remove(
-        ruby: &Ruby,
-        rb_self: Obj<Self>,
-        Whole(element): Whole<u64>,
-    ) -> Result<Symbol, Error> {
+    fn remove(ruby: &Ruby, rb_self: Obj<Self>, element: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
+        let element: u64 = integer(element, "element")?;
         let outcome = set!(&mut *rb_self.0.borrow_mut(), |set| set.remove(&element));
         Ok(ruby.to_symbol(match outcome {
             Removing::Removed => "removed",
@@ -83,8 +87,9 @@ impl Wrapper {
         }))
     }
 
-    fn includes(&self, Whole(element): Whole<u64>) -> bool {
-        set!(&*self.0.borrow(), |set| set.contains(&element))
+    fn includes(&self, element: Value) -> Result<bool, Error> {
+        let element: u64 = integer(element, "element")?;
+        Ok(set!(&*self.0.borrow(), |set| set.contains(&element)))
     }
 
     /// `OrSet::iter`, collected.
@@ -106,7 +111,7 @@ impl Wrapper {
         let adds: Vec<Tagged<u64>> = set!(&*rb_self.0.borrow(), |set| set.adds().collect());
         let out = ruby.ary_new_capa(adds.len());
         for add in adds {
-            out.push(data::tagged(classes, add)?)?;
+            out.push(data::tagged(ruby, classes, add)?)?;
         }
         Ok(out)
     }
@@ -117,22 +122,23 @@ impl Wrapper {
         let tags: Vec<Tag> = set!(&*rb_self.0.borrow(), |set| set.removes().collect());
         let out = ruby.ary_new_capa(tags.len());
         for tag in tags {
-            out.push(data::tag(classes, tag)?)?;
+            out.push(data::tag(ruby, classes, tag)?)?;
         }
         Ok(out)
     }
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = <&Self>::try_convert(other)
-            .map(|other| other.0.borrow().clone())
-            .map_err(|_| expected(ruby, "a MergeMachines::OrSet", other))?;
+        let source = Self::exact(ruby, other, "expected a MergeMachines::OrSet")?
+            .0
+            .borrow()
+            .clone();
         let outcome = rb_self.0.borrow_mut().absorb(&source);
         merged(ruby, outcome, other, "a OrSet of the same capacity")
     }
 
-    fn eq(&self, other: Value) -> bool {
-        <&Self>::try_convert(other).is_ok_and(|other| self.0.borrow().same(&other.0.borrow()))
+    fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
+        Self::exact(ruby, other, "").is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
     }
 
     /// `OrSet::encoded`.
@@ -152,6 +158,7 @@ impl Wrapper {
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = module.define_class("OrSet", ruby.class_object())?;
+    CLASS.set(ruby, Class::pin(ruby, class))?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Wrapper::new, 1))?;
     class.define_singleton_method("decode", function!(Wrapper::decode, 1))?;

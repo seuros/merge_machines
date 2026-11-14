@@ -34,6 +34,7 @@ pub struct LogicalClock {
 }
 
 impl LogicalClock {
+    /// A clock that has issued nothing: `now` is 0.
     #[must_use]
     pub const fn new() -> Self {
         Self { counter: 0 }

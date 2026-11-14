@@ -130,6 +130,7 @@ impl<T: Clone + PartialEq, S: Ord + Copy> LwwRegister<T, S> {
         }
     }
 
+    /// The value of the write held.
     #[must_use]
     pub const fn value(&self) -> &T {
         &self.value

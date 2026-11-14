@@ -1,4 +1,5 @@
 use crate::{Adding, Merge, OrSet, Refusal, Removing, Tag};
+use matryona_machines::testing::{refuses, unchanged};
 
 #[test]
 fn an_element_leaves_once_its_tags_are_tombstoned() {
@@ -78,11 +79,11 @@ fn the_same_tag_twice_claims_one_slot() {
     let mut set = OrSet::<u8, 1>::new();
     assert_eq!(set.add(1, Tag::new(1, 1)), Ok(Adding::Added));
 
-    let before = set;
-    assert_eq!(set.add(1, Tag::new(1, 1)), Ok(Adding::Duplicate));
-    assert_eq!(set, before);
-    assert_eq!(set.add(1, Tag::new(1, 2)), Err(Refusal::Full));
-    assert_eq!(set, before);
+    assert_eq!(
+        unchanged(&mut set, |s| s.add(1, Tag::new(1, 1))),
+        Ok(Adding::Duplicate)
+    );
+    refuses(&mut set, Refusal::Full, |s| s.add(1, Tag::new(1, 2)));
 }
 
 #[test]
@@ -91,17 +92,16 @@ fn one_tag_naming_another_element_is_a_mismatch() {
     assert_eq!(set.add(1, Tag::new(1, 1)), Ok(Adding::Added));
     assert_eq!(set.remove(&1), Removing::Removed);
 
-    let before = set;
-    assert_eq!(set.add(2, Tag::new(1, 1)), Err(Refusal::Mismatch));
-    assert_eq!(set, before);
+    refuses(&mut set, Refusal::Mismatch, |s| s.add(2, Tag::new(1, 1)));
     // The tombstoned add itself is still a repeat, not a new add.
-    assert_eq!(set.add(1, Tag::new(1, 1)), Ok(Adding::Duplicate));
-    assert_eq!(set, before);
+    assert_eq!(
+        unchanged(&mut set, |s| s.add(1, Tag::new(1, 1))),
+        Ok(Adding::Duplicate)
+    );
 
     let mut other = OrSet::<u8, 4>::new();
     assert_eq!(other.add(2, Tag::new(1, 1)), Ok(Adding::Added));
-    assert_eq!(set.merge(&other), Err(Refusal::Mismatch));
-    assert_eq!(set, before);
+    refuses(&mut set, Refusal::Mismatch, |s| s.merge(&other));
 }
 
 #[test]
@@ -111,9 +111,7 @@ fn removing_what_is_not_held_changes_nothing() {
     assert_eq!(set.add(1, Tag::new(1, 1)), Ok(Adding::Added));
     assert_eq!(set.remove(&1), Removing::Removed);
 
-    let before = set;
-    assert_eq!(set.remove(&1), Removing::NotHeld);
-    assert_eq!(set, before);
+    assert_eq!(unchanged(&mut set, |s| s.remove(&1)), Removing::NotHeld);
 }
 
 #[test]
@@ -129,9 +127,7 @@ fn a_refused_merge_lands_neither_adds_nor_tombstones() {
     assert_eq!(crowded.add(1, Tag::new(1, 1)), Ok(Adding::Added));
     assert_eq!(crowded.add(3, Tag::new(3, 1)), Ok(Adding::Added));
 
-    let before = crowded;
-    assert_eq!(crowded.merge(&right), Err(Refusal::Full));
-    assert_eq!(crowded, before);
+    refuses(&mut crowded, Refusal::Full, |c| c.merge(&right));
     assert!(
         crowded.contains(&1),
         "the tombstone for (1, 1) must not land"

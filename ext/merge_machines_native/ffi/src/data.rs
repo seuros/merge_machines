@@ -8,7 +8,7 @@
 //! mutated never has to find a constant.
 
 use magnus::{Error, RClass, RModule, Ruby, Value, function, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_struct_with, integer};
+use matryona_machines::ruby::{Class, Registry, exact_fields_with, integer};
 
 use crate::expected_message;
 use merge_machines::{Entry, HybridTimestamp, Tag, Tagged};
@@ -84,11 +84,8 @@ fn pair(
     what: &str,
     [first, second]: [&str; 2],
 ) -> Result<(u64, u64), Error> {
-    let fields = exact_struct_with(ruby, value, class, || expected_message(what, value))?;
-    Ok((
-        integer(fields.aref(0)?, first)?,
-        integer(fields.aref(1)?, second)?,
-    ))
+    let [one, two] = exact_fields_with::<2>(ruby, value, class, || expected_message(what, value))?;
+    Ok((integer(one, first)?, integer(two, second)?))
 }
 
 /// The core timestamp a `MergeMachines::Timestamp` names.

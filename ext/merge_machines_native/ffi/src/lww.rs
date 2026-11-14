@@ -12,13 +12,13 @@ use magnus::typed_data::Obj;
 use magnus::{
     Error, Integer, IntoValue, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*,
 };
-use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
+use matryona_machines::ruby::{Class, Message, Registry, bytes, exact_typed_with, integer};
 use merge_machines::{
     HybridTimestamp, LwwRegister, Merge, Refusal, ReplicaId, STAMP_HYBRID, STAMP_LOGICAL, Writing,
 };
 
 use crate::data::{self, classes, timestamp_from};
-use crate::{SHAPE, expected, merged, refusal, refused_frame};
+use crate::{SHAPE, expected, expected_class, merged, refusal, refused_frame};
 
 /// A register stamped by one of the two clocks.
 #[derive(Clone, PartialEq, Eq)]
@@ -50,8 +50,8 @@ struct Wrapper(RefCell<Register>);
 impl Wrapper {
     /// `value` as exactly a `MergeMachines::LwwRegister`: `TypeError` with `message`
     /// for anything else, a subclass instance included.
-    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
-        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    fn exact(ruby: &Ruby, value: Value, message: impl Message) -> Result<Obj<Self>, Error> {
+        exact_typed_with(ruby, value, CLASS.get(ruby)?.get(ruby), message)
     }
 
     /// `LwwRegister::new(value, stamp, replica)`, of the kind `stamp` is.
@@ -66,8 +66,8 @@ impl Wrapper {
     }
 
     /// `LwwRegister::decode`, of the kind of stamp the frame names.
-    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
-        let frame = frame.to_bytes();
+    fn decode(ruby: &Ruby, frame: Value) -> Result<Self, Error> {
+        let frame = bytes(frame, "frame")?;
         let kind = frame.get(SHAPE).map(|field| [field[0], field[1]]);
         let decoded = match kind {
             None => Err(Refusal::Truncated),
@@ -137,10 +137,12 @@ impl Wrapper {
     /// once this one's borrow has ended: naming it runs `other.inspect`.
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = Self::exact(ruby, other, "expected a MergeMachines::LwwRegister")?
-            .0
-            .borrow()
-            .clone();
+        let source = Self::exact(ruby, other, || {
+            expected_class("a MergeMachines::LwwRegister", other)
+        })?
+        .0
+        .borrow()
+        .clone();
         let outcome = match (&mut *rb_self.0.borrow_mut(), &source) {
             (Register::Logical(held), Register::Logical(theirs)) => Some(held.merge(theirs)),
             (Register::Hybrid(held), Register::Hybrid(theirs)) => Some(held.merge(theirs)),
@@ -151,7 +153,7 @@ impl Wrapper {
     }
 
     fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
-        Self::exact(ruby, other, "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
+        Self::exact(ruby, other, || "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
     }
 
     /// `LwwRegister::encoded`.

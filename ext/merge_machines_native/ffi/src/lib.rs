@@ -98,3 +98,9 @@ pub(crate) fn expected(ruby: &Ruby, what: &str, given: Value) -> Error {
 pub(crate) fn expected_message(what: &str, given: Value) -> String {
     format!("expected {what}, got {}", given.inspect())
 }
+
+/// The `TypeError` message for a partner state of the wrong class, naming
+/// the class received. Built only on refusal.
+pub(crate) fn expected_class(what: &str, given: Value) -> String {
+    format!("expected {what}, got {}", given.class())
+}

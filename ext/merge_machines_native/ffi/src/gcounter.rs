@@ -4,12 +4,12 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, RArray, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
+use matryona_machines::ruby::{Class, Message, Registry, bytes, exact_typed_with, integer};
 use merge_machines::{Entry, GCounter, ReplicaId};
 
 use crate::data::{self, classes};
 use crate::shape::shaped;
-use crate::{merged, unit};
+use crate::{expected_class, merged, unit};
 
 /// The counter at a single replica count.
 type Held<const R: usize> = GCounter<R>;
@@ -41,8 +41,8 @@ const fn replicas_of<const R: usize>(_: &Held<R>) -> usize {
 impl Wrapper {
     /// `value` as exactly a `MergeMachines::GCounter`: `TypeError` with `message`
     /// for anything else, a subclass instance included.
-    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
-        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    fn exact(ruby: &Ruby, value: Value, message: impl Message) -> Result<Obj<Self>, Error> {
+        exact_typed_with(ruby, value, CLASS.get(ruby)?.get(ruby), message)
     }
 
     /// `GCounter::<replicas>::new()`.
@@ -52,8 +52,8 @@ impl Wrapper {
     }
 
     /// `GCounter::decode`, at the replica count the frame names.
-    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
-        let frame = frame.to_bytes();
+    fn decode(ruby: &Ruby, frame: Value) -> Result<Self, Error> {
+        let frame = bytes(frame, "frame")?;
         Counter::decoded(ruby, &frame).map(|held| Self(RefCell::new(held)))
     }
 
@@ -98,16 +98,19 @@ impl Wrapper {
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = Self::exact(ruby, other, "expected a MergeMachines::GCounter")?
-            .0
-            .borrow()
-            .clone();
+        let source = Self::exact(ruby, other, || {
+            expected_class("a MergeMachines::GCounter", other)
+        })?
+        .0
+        .borrow()
+        .clone();
         let outcome = rb_self.0.borrow_mut().absorb(&source);
         merged(ruby, outcome, other, "a GCounter of the same replica count")
     }
 
     fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
-        Self::exact(ruby, other, "").is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
+        Self::exact(ruby, other, || "")
+            .is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
     }
 
     /// `GCounter::encoded`.

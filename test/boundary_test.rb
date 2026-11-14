@@ -110,6 +110,35 @@ module MergeMachines
       refute_equal GCounter.new(4), Object.new
     end
 
+    # A partner of the wrong class is refused with a message naming the
+    # class it was.
+    def test_a_wrong_partner_is_named_by_its_class
+      error = assert_raises(TypeError) { GCounter.new(4).merge(PNCounter.new(4)) }
+      assert_equal 'expected a MergeMachines::GCounter, got MergeMachines::PNCounter', error.message
+      error = assert_raises(TypeError) { GSet.new(64).merge(5) }
+      assert_equal 'expected a MergeMachines::GSet, got Integer', error.message
+      error = assert_raises(TypeError) { LwwRegister.new(1, 5, 2).merge(nil) }
+      assert_equal 'expected a MergeMachines::LwwRegister, got NilClass', error.message
+    end
+
+    # A frame is exactly a String: a subclass, an object answering `to_str`
+    # and a String with a redefined `#bytes` change nothing about that.
+    def test_a_frame_is_exactly_a_string
+      subclass = Class.new(String)
+      stringly = Object.new.tap { |o| o.define_singleton_method(:to_str) { GCounter.new(4).encoded } }
+      [GCounter.new(4), PNCounter.new(4), GSet.new(64), OrSet.new(64), LwwRegister.new(1, 5, 2),
+       LogicalClock.new, HybridClock.new].each do |held|
+        state = held.class
+        frame = held.encoded
+        error = assert_raises(TypeError) { state.decode(subclass.new(frame)) }
+        assert_equal 'frame must be a String', error.message
+        assert_raises(TypeError) { state.decode(stringly) }
+        assert_raises(TypeError) { state.decode(:frame) }
+        lying = frame.dup.tap { |f| f.define_singleton_method(:bytes) { raise 'the binding ran #bytes' } }
+        assert_equal state.decode(frame), state.decode(lying)
+      end
+    end
+
     # The classes are resolved at init and pinned, so a compaction moves none
     # of them: every path that builds or checks a value still works after it.
     def test_every_value_path_survives_gc_compact

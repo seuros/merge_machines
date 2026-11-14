@@ -4,7 +4,7 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, IntoValue, RModule, RString, Ruby, Value, function, method, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
+use matryona_machines::ruby::{Class, Message, Registry, bytes, exact_typed_with, integer};
 use merge_machines::{LogicalClock, Refusal};
 
 use crate::{refusal, refused_frame};
@@ -26,8 +26,8 @@ fn stamped(ruby: &Ruby, outcome: Result<u64, Refusal>) -> Value {
 impl Wrapper {
     /// `value` as exactly a `MergeMachines::LogicalClock`: `TypeError` with `message`
     /// for anything else, a subclass instance included.
-    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
-        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    fn exact(ruby: &Ruby, value: Value, message: impl Message) -> Result<Obj<Self>, Error> {
+        exact_typed_with(ruby, value, CLASS.get(ruby)?.get(ruby), message)
     }
 
     const fn new() -> Self {
@@ -35,8 +35,8 @@ impl Wrapper {
     }
 
     /// `LogicalClock::decode`.
-    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
-        let frame = frame.to_bytes();
+    fn decode(ruby: &Ruby, frame: Value) -> Result<Self, Error> {
+        let frame = bytes(frame, "frame")?;
         LogicalClock::decode(&frame)
             .map(|clock| Self(RefCell::new(clock)))
             .map_err(|refused| refused_frame(ruby, refused))
@@ -63,7 +63,7 @@ impl Wrapper {
     }
 
     fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
-        Self::exact(ruby, other, "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
+        Self::exact(ruby, other, || "").is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
     }
 
     /// `LogicalClock::encoded`.

@@ -6,12 +6,12 @@ use std::cell::RefCell;
 
 use magnus::typed_data::Obj;
 use magnus::{Error, RArray, RModule, RString, Ruby, Symbol, Value, function, method, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_typed, integer};
+use matryona_machines::ruby::{Class, Message, Registry, bytes, exact_typed_with, integer};
 use merge_machines::{Adding, OrSet, Removing, Tag, Tagged};
 
 use crate::data::{self, classes, tag_from};
 use crate::shape::shaped;
-use crate::{merged, refusal};
+use crate::{expected_class, merged, refusal};
 
 /// The set at a single capacity, over the 64-bit elements a frame carries.
 type Held<const N: usize> = OrSet<u64, N>;
@@ -42,8 +42,8 @@ const fn capacity_of<const N: usize>(_: &Held<N>) -> usize {
 impl Wrapper {
     /// `value` as exactly a `MergeMachines::OrSet`: `TypeError` with `message`
     /// for anything else, a subclass instance included.
-    fn exact(ruby: &Ruby, value: Value, message: &'static str) -> Result<Obj<Self>, Error> {
-        exact_typed(ruby, value, CLASS.get(ruby)?.get(ruby), message)
+    fn exact(ruby: &Ruby, value: Value, message: impl Message) -> Result<Obj<Self>, Error> {
+        exact_typed_with(ruby, value, CLASS.get(ruby)?.get(ruby), message)
     }
 
     /// `OrSet::<u64, capacity>::new()`.
@@ -53,8 +53,8 @@ impl Wrapper {
     }
 
     /// `OrSet::decode`, at the capacity the frame names.
-    fn decode(ruby: &Ruby, frame: RString) -> Result<Self, Error> {
-        let frame = frame.to_bytes();
+    fn decode(ruby: &Ruby, frame: Value) -> Result<Self, Error> {
+        let frame = bytes(frame, "frame")?;
         Set::decoded(ruby, &frame).map(|held| Self(RefCell::new(held)))
     }
 
@@ -129,16 +129,19 @@ impl Wrapper {
 
     fn merge(ruby: &Ruby, rb_self: Obj<Self>, other: Value) -> Result<Symbol, Error> {
         rb_self.check_frozen()?;
-        let source = Self::exact(ruby, other, "expected a MergeMachines::OrSet")?
-            .0
-            .borrow()
-            .clone();
+        let source = Self::exact(ruby, other, || {
+            expected_class("a MergeMachines::OrSet", other)
+        })?
+        .0
+        .borrow()
+        .clone();
         let outcome = rb_self.0.borrow_mut().absorb(&source);
         merged(ruby, outcome, other, "a OrSet of the same capacity")
     }
 
     fn eq(ruby: &Ruby, rb_self: &Self, other: Value) -> bool {
-        Self::exact(ruby, other, "").is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
+        Self::exact(ruby, other, || "")
+            .is_ok_and(|other| rb_self.0.borrow().same(&other.0.borrow()))
     }
 
     /// `OrSet::encoded`.

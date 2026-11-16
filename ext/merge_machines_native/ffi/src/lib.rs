@@ -70,10 +70,11 @@ macro_rules! merge {
 }
 pub(crate) use merge;
 
-/// A wrapper file's `define`: creates `MergeMachines::$name`, pins it in the
-/// file's `CLASS`, undefines its allocator and binds `new` (taking `$arity`
-/// arguments), `decode`, the listed methods in order, then `==`, `encoded`
-/// and `inspect`.
+/// A wrapper file's `define`: creates `MergeMachines::$name`, undefines its
+/// allocator and binds `new` (taking `$arity` arguments), `decode`, the listed
+/// methods in order, then `==`, `encoded` and `inspect`, and last pins it in
+/// the file's `CLASS`, fixing magnus's class for `Wrapper` to it: no
+/// conversion of a `Wrapper` runs `Object.const_get` later.
 macro_rules! define {
     ($name:literal, new($arity:tt) {
         $($method:literal => $function:ident($args:tt)),* $(,)?
@@ -85,7 +86,6 @@ macro_rules! define {
         ) -> Result<(), ::magnus::Error> {
             use ::magnus::prelude::*;
             let class = module.define_class($name, ruby.class_object())?;
-            CLASS.set(ruby, ::matryona_machines::ruby::Class::pin(ruby, class))?;
             class.undef_default_alloc_func();
             class.define_singleton_method("new", ::magnus::function!(Wrapper::new, $arity))?;
             class.define_singleton_method("decode", ::magnus::function!(Wrapper::decode, 1))?;
@@ -93,7 +93,8 @@ macro_rules! define {
             class.define_method("==", ::magnus::method!(Wrapper::eq, 1))?;
             class.define_method("encoded", ::magnus::method!(Wrapper::encoded, 0))?;
             class.define_method("inspect", ::magnus::method!(Wrapper::inspect, 0))?;
-            Ok(())
+            let pinned = ::matryona_machines::ruby::Class::pin_wrapped::<Wrapper>(ruby, class)?;
+            CLASS.set(ruby, pinned).map(drop)
         }
     };
 }

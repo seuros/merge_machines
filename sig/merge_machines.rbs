@@ -240,4 +240,11 @@ module MergeMachines
     def encoded: () -> String
     def inspect: () -> String
   end
+
+  # Private native hooks each Data value's `initialize` validates its fields
+  # through: nil, or TypeError/RangeError.
+  private def self.__timestamp: (Integer wall_ns, Integer counter) -> nil
+  private def self.__entry: (Integer replica, Integer count) -> nil
+  private def self.__tag: (Integer replica, Integer counter) -> nil
+  private def self.__tagged: (Integer element, Tag tag) -> nil
 end

@@ -1,15 +1,11 @@
 //! A counter that goes both ways, from two that only go up.
 
 use crate::{
-    GCounter, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_PNCOUNTER, read_small,
-    small_field, tagged_frame,
+    GCounter, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG_LEN, TAG_PNCOUNTER, Writer, tagged_frame,
 };
 
-/// Where the shape sits in a frame.
-const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
-
-/// Where the slot table of what went up starts in a frame.
-const INCREMENTS: usize = SHAPE.end;
+/// Bytes a frame spends ahead of its two slot tables: the tag then the shape.
+const HEAD_LEN: usize = TAG_LEN + SHAPE_LEN;
 
 /// A counter replicas can both raise and lower.
 ///
@@ -67,6 +63,9 @@ impl<const R: usize> PNCounter<R> {
     /// Everything added, minus everything taken away.
     #[must_use]
     pub fn value(&self) -> i128 {
+        // Each side totals at most `R` counts below 2^64, far below 2^127
+        // for any `R` that fits in memory, so the difference of two
+        // nonnegative totals cannot overflow.
         total(&self.increments) - total(&self.decrements)
     }
 
@@ -82,21 +81,18 @@ impl<const R: usize> PNCounter<R> {
         self.decrements.value()
     }
 
-    /// Where the slot table of what came down starts in a frame.
-    const DECREMENTS: usize = INCREMENTS + GCounter::<R>::BODY_LEN;
-
-    /// Length of the [`encode`](Self::encode) frame.
-    pub const ENCODED_LEN: usize = Self::DECREMENTS + GCounter::<R>::BODY_LEN;
+    /// Length of the [`encode`](Self::encode) frame: the head, then the slot
+    /// table of what went up, then the one of what came down.
+    pub const ENCODED_LEN: usize = HEAD_LEN + 2 * GCounter::<R>::BODY_LEN;
 
     encoders!("counter");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame[TAG] = TAG_PNCOUNTER;
-        frame[SHAPE].copy_from_slice(&small_field(R));
-        self.increments
-            .write_body(&mut frame[INCREMENTS..Self::DECREMENTS]);
-        self.decrements.write_body(&mut frame[Self::DECREMENTS..]);
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_PNCOUNTER)?;
+        frame.small(R)?;
+        self.increments.write_body(frame)?;
+        self.decrements.write_body(frame)
     }
 
     /// Reads a counter written by [`encode`](Self::encode).
@@ -122,13 +118,13 @@ impl<const R: usize> PNCounter<R> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_PNCOUNTER)?;
-        if read_small(&frame[SHAPE]) != R {
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_PNCOUNTER)?;
+        if frame.small()? != R {
             return Err(Refusal::WrongShape);
         }
 
-        let increments = GCounter::read_body(&frame[INCREMENTS..Self::DECREMENTS])?;
-        let decrements = GCounter::read_body(&frame[Self::DECREMENTS..])?;
+        let increments = GCounter::read_body(&mut frame)?;
+        let decrements = GCounter::read_body(&mut frame)?;
         *self = Self {
             increments,
             decrements,

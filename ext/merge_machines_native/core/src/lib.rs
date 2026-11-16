@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 
 //! Conflict-free replicated data types and the clocks they need.
 //!
@@ -173,9 +174,6 @@ pub(crate) const TAG_LWW_REGISTER: u8 = 0x71;
 pub(crate) const TAG_GSET: u8 = 0x81;
 pub(crate) const TAG_ORSET: u8 = 0x82;
 
-/// Where a frame's leading structure tag sits.
-pub(crate) const TAG: usize = 0;
-
 /// Bytes a frame spends on its leading structure tag.
 pub(crate) const TAG_LEN: usize = 1;
 
@@ -188,58 +186,149 @@ pub(crate) const COUNT_LEN: usize = 2;
 /// Bytes a frame spends on one 64-bit field.
 pub(crate) const FIELD_LEN: usize = 8;
 
-/// A frame's 64-bit field, read from `field`, which is [`FIELD_LEN`] long.
-pub(crate) const fn read_u64(field: &[u8]) -> u64 {
-    let mut bytes = [0_u8; FIELD_LEN];
-    bytes.copy_from_slice(field);
-    u64::from_le_bytes(bytes)
-}
-
 /// The low two bytes of `value`, as a frame's shape or count field.
 pub(crate) const fn small_field(value: usize) -> [u8; SHAPE_LEN] {
     let [low, high, ..] = value.to_le_bytes();
     [low, high]
 }
 
-/// A frame's shape or count field, read from `field`, which is [`SHAPE_LEN`]
-/// long.
-pub(crate) fn read_small(field: &[u8]) -> usize {
-    let mut bytes = [0_u8; SHAPE_LEN];
-    bytes.copy_from_slice(field);
-    usize::from(u16::from_le_bytes(bytes))
+/// Reads a frame front to back, one field at a time.
+///
+/// Every frame is checked to be its full `ENCODED_LEN`, the sum of its
+/// fields, before a reader walks it, so a field always finds its bytes. Were
+/// the layout ever wrong, the field answers [`Refusal::Truncated`] instead of
+/// panicking, and the decode it belongs to changes nothing.
+pub(crate) struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    /// The next `len` bytes.
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], Refusal> {
+        let (head, rest) = self.0.split_at_checked(len).ok_or(Refusal::Truncated)?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    /// The next `N` bytes.
+    pub(crate) fn field<const N: usize>(&mut self) -> Result<[u8; N], Refusal> {
+        let (head, rest) = self.0.split_first_chunk::<N>().ok_or(Refusal::Truncated)?;
+        self.0 = rest;
+        Ok(*head)
+    }
+
+    /// The next byte.
+    pub(crate) fn byte(&mut self) -> Result<u8, Refusal> {
+        self.field().map(|[byte]: [u8; 1]| byte)
+    }
+
+    /// The next 64-bit field.
+    pub(crate) fn u64(&mut self) -> Result<u64, Refusal> {
+        self.field::<FIELD_LEN>().map(u64::from_le_bytes)
+    }
+
+    /// The next shape or count field.
+    pub(crate) fn small(&mut self) -> Result<usize, Refusal> {
+        self.field::<SHAPE_LEN>()
+            .map(|bytes| usize::from(u16::from_le_bytes(bytes)))
+    }
+}
+
+/// Writes a frame front to back, one field at a time.
+///
+/// Every frame handed to a writer is exactly `ENCODED_LEN` bytes, the sum of
+/// its fields, so a field always finds room. Were the layout ever wrong, the
+/// field answers [`Refusal::Truncated`] instead of panicking.
+pub(crate) struct Writer<'a>(&'a mut [u8]);
+
+impl<'a> Writer<'a> {
+    pub(crate) const fn new(frame: &'a mut [u8]) -> Self {
+        Self(frame)
+    }
+
+    /// The next `len` bytes, for the caller to fill.
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a mut [u8], Refusal> {
+        let rest = core::mem::take(&mut self.0);
+        let (head, rest) = rest.split_at_mut_checked(len).ok_or(Refusal::Truncated)?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    /// Writes `bytes` as the next field.
+    pub(crate) fn put<const N: usize>(&mut self, bytes: [u8; N]) -> Result<(), Refusal> {
+        let rest = core::mem::take(&mut self.0);
+        let (head, rest) = rest
+            .split_first_chunk_mut::<N>()
+            .ok_or(Refusal::Truncated)?;
+        *head = bytes;
+        self.0 = rest;
+        Ok(())
+    }
+
+    /// Writes `value` as the next byte.
+    pub(crate) fn byte(&mut self, value: u8) -> Result<(), Refusal> {
+        self.put([value])
+    }
+
+    /// Writes `value` as the next 64-bit field.
+    pub(crate) fn u64(&mut self, value: u64) -> Result<(), Refusal> {
+        self.put(value.to_le_bytes())
+    }
+
+    /// Writes `value` as the next shape or count field.
+    pub(crate) fn small(&mut self, value: usize) -> Result<(), Refusal> {
+        self.put(small_field(value))
+    }
 }
 
 /// Writes a frame of `len` bytes at the front of `out` through `fill`,
-/// returning the number of bytes written.
+/// returning the number of bytes written. The frame starts zeroed, so slot
+/// records past the held ones read as zeros.
+///
+/// `fill` only fails when a frame's layout disagrees with its own
+/// `ENCODED_LEN`, which no frame here does; it would answer
+/// [`Refusal::Truncated`] with the front of `out` partly written.
 pub(crate) fn write_into(
     out: &mut [u8],
     len: usize,
-    fill: impl FnOnce(&mut [u8]),
+    fill: impl FnOnce(&mut Writer<'_>) -> Result<(), Refusal>,
 ) -> Result<usize, Refusal> {
     let Some(frame) = out.get_mut(..len) else {
         return Err(Refusal::Truncated);
     };
-    fill(frame);
+    frame.fill(0);
+    fill(&mut Writer::new(frame))?;
     Ok(len)
 }
 
 /// A frame of exactly `len` bytes, filled by `fill`.
 #[cfg(feature = "alloc")]
-pub(crate) fn boxed_frame(len: usize, fill: impl FnOnce(&mut [u8])) -> alloc::boxed::Box<[u8]> {
+pub(crate) fn boxed_frame(
+    len: usize,
+    fill: impl FnOnce(&mut Writer<'_>) -> Result<(), Refusal>,
+) -> alloc::boxed::Box<[u8]> {
     let mut frame = alloc::vec![0_u8; len].into_boxed_slice();
-    fill(&mut frame);
+    if fill(&mut Writer::new(&mut frame)).is_err() {
+        debug_assert!(false, "a frame of ENCODED_LEN bytes holds every field");
+        // An empty frame: every decode refuses it as truncated.
+        return alloc::boxed::Box::default();
+    }
     frame
 }
 
-/// The `len`-byte frame `bytes` leads with, which `tag` has to name.
-pub(crate) fn tagged_frame(bytes: &[u8], len: usize, tag: u8) -> Result<&[u8], Refusal> {
+/// The `len`-byte frame `bytes` leads with, which `tag` has to name, read
+/// past the tag.
+pub(crate) fn tagged_frame(bytes: &[u8], len: usize, tag: u8) -> Result<Reader<'_>, Refusal> {
     let Some(frame) = bytes.get(..len) else {
         return Err(Refusal::Truncated);
     };
-    if frame[TAG] != tag {
+    let mut reader = Reader::new(frame);
+    if reader.byte()? != tag {
         return Err(Refusal::WrongStructure);
     }
-    Ok(frame)
+    Ok(reader)
 }
 
 /// Whether the `incoming` slots `unseen` marks fit in the free slots of

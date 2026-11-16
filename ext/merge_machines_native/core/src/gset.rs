@@ -1,18 +1,13 @@
 //! A set that only grows.
 
 use crate::{
-    COUNT_LEN, FIELD_LEN, Merge, Refusal, SHAPE_LEN, TAG, TAG_GSET, TAG_LEN, fill_free, fits_free,
-    read_small, read_u64, same_elements, small_field, tagged_frame,
+    COUNT_LEN, FIELD_LEN, Merge, Refusal, SHAPE_LEN, TAG_GSET, TAG_LEN, Writer, fill_free,
+    fits_free, same_elements, tagged_frame,
 };
 
-/// Where the shape sits in a frame.
-const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
-
-/// Where the number of records carrying an element sits in a frame.
-const HELD: core::ops::Range<usize> = SHAPE.end..SHAPE.end + COUNT_LEN;
-
-/// Where the element records start in a frame.
-const RECORDS: usize = HELD.end;
+/// Bytes a frame spends ahead of its element records: the tag, the shape and
+/// the number of records carrying an element, in that order.
+const HEAD_LEN: usize = TAG_LEN + SHAPE_LEN + COUNT_LEN;
 
 /// What an honoured [`GSet::insert`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,21 +90,24 @@ impl<T: Copy + PartialEq, const N: usize> GSet<T, N> {
 
 impl<const N: usize> GSet<u64, N> {
     /// Length of the [`encode`](Self::encode) frame.
-    pub const ENCODED_LEN: usize = RECORDS + N * FIELD_LEN;
+    pub const ENCODED_LEN: usize = HEAD_LEN + Self::RECORDS_LEN;
+
+    /// Bytes a frame spends on its element records.
+    const RECORDS_LEN: usize = N * FIELD_LEN;
 
     encoders!("set");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame.fill(0);
-        frame[TAG] = TAG_GSET;
-        frame[SHAPE].copy_from_slice(&small_field(N));
-        frame[HELD].copy_from_slice(&small_field(self.len()));
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_GSET)?;
+        frame.small(N)?;
+        frame.small(self.len())?;
 
-        let (records, _) = frame[RECORDS..].as_chunks_mut::<FIELD_LEN>();
+        let (records, _) = frame.take(Self::RECORDS_LEN)?.as_chunks_mut::<FIELD_LEN>();
         for (record, element) in records.iter_mut().zip(self.iter()) {
             *record = element.to_le_bytes();
         }
+        Ok(())
     }
 
     /// Reads a set written by [`encode`](Self::encode).
@@ -135,20 +133,20 @@ impl<const N: usize> GSet<u64, N> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GSET)?;
-        if read_small(&frame[SHAPE]) != N {
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GSET)?;
+        if frame.small()? != N {
             return Err(Refusal::WrongShape);
         }
 
-        let held = read_small(&frame[HELD]);
+        let held = frame.small()?;
         if held > N {
             return Err(Refusal::Malformed);
         }
-        let (records, _) = frame[RECORDS..].as_chunks::<FIELD_LEN>();
+        let (records, _) = frame.take(Self::RECORDS_LEN)?.as_chunks::<FIELD_LEN>();
 
         let mut set = Self::new();
         for (slot, record) in set.slots.iter_mut().zip(records.iter().take(held)) {
-            *slot = Some(read_u64(record));
+            *slot = Some(u64::from_le_bytes(*record));
         }
         let repeated = |element: u64| set.iter().filter(|held| *held == element).count() > 1;
         if set.iter().any(repeated) {

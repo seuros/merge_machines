@@ -9,7 +9,7 @@ use matryona_machines::testing::refuses;
 
 use crate::{
     Adding, GCounter, GSet, HybridClock, HybridTimestamp, Inserting, LogicalClock, LwwRegister,
-    OrSet, PNCounter, Refusal, Removing, TAG, Tag,
+    OrSet, PNCounter, Refusal, Removing, Tag,
 };
 
 /// The codec every state carries, gathered so one test can drive them all.
@@ -82,7 +82,7 @@ fn assert_contract<S: Framed>(state: &S, foreign: u8) {
 
     let mut other = [0_u8; ROOM];
     other[..S::LEN].copy_from_slice(frame);
-    other[TAG] = foreign;
+    other[0] = foreign;
     for (bytes, refusal) in [
         (&frame[..S::LEN - 1], Refusal::Truncated),
         (&[][..], Refusal::Truncated),

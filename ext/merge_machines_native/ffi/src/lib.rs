@@ -9,6 +9,96 @@
 //! and never raises. A frame `decode` refuses raises `RangeError`: it is saved
 //! state a restoring constructor turned down.
 
+/// A wrapper's `exact`, inside its `impl`: `value` as exactly the class the
+/// file's `CLASS` registry pins, `TypeError` with `message` otherwise.
+macro_rules! exact {
+    ($class:literal) => {
+        #[doc = concat!("`value` as exactly a `", $class, "`: `TypeError` with `message`")]
+        /// for anything else, a subclass instance included.
+        fn exact(
+            ruby: &::magnus::Ruby,
+            value: ::magnus::Value,
+            message: impl ::matryona_machines::ruby::Message,
+        ) -> Result<::magnus::typed_data::Obj<Self>, ::magnus::Error> {
+            ::matryona_machines::ruby::exact_typed_with(
+                ruby,
+                value,
+                CLASS.get(ruby)?.get(ruby),
+                message,
+            )
+        }
+    };
+}
+pub(crate) use exact;
+
+/// A wrapper's `==`, inside its `impl`: true for an equal state of exactly
+/// the class [`exact!`] pins, false for anything else, never raising.
+macro_rules! eq {
+    () => {
+        /// `==`: an equal state of exactly this class.
+        fn eq(ruby: &::magnus::Ruby, rb_self: &Self, other: ::magnus::Value) -> bool {
+            Self::exact(ruby, other, || "")
+                .is_ok_and(|other| *rb_self.0.borrow() == *other.0.borrow())
+        }
+    };
+}
+pub(crate) use eq;
+
+/// A wrapper's `merge`, inside its `impl`: folds in a copy of exactly a
+/// `$class` through the held state's `absorb`. `TypeError` naming the class
+/// received for another class; `TypeError` naming `$what` once the borrow has
+/// ended when `absorb` pairs nothing, as naming it runs `other.inspect`.
+macro_rules! merge {
+    ($class:literal, $what:literal) => {
+        /// `:merged` or the refusal's symbol.
+        fn merge(
+            ruby: &::magnus::Ruby,
+            rb_self: ::magnus::typed_data::Obj<Self>,
+            other: ::magnus::Value,
+        ) -> Result<::magnus::Symbol, ::magnus::Error> {
+            rb_self.check_frozen()?;
+            let source = Self::exact(ruby, other, || {
+                $crate::expected_class(concat!("a ", $class), other)
+            })?
+            .0
+            .borrow()
+            .clone();
+            let outcome = rb_self.0.borrow_mut().absorb(&source);
+            $crate::merged(ruby, outcome, other, $what)
+        }
+    };
+}
+pub(crate) use merge;
+
+/// A wrapper file's `define`: creates `MergeMachines::$name`, pins it in the
+/// file's `CLASS`, undefines its allocator and binds `new` (taking `$arity`
+/// arguments), `decode`, the listed methods in order, then `==`, `encoded`
+/// and `inspect`.
+macro_rules! define {
+    ($name:literal, new($arity:tt) {
+        $($method:literal => $function:ident($args:tt)),* $(,)?
+    }) => {
+        #[doc = concat!("Defines `MergeMachines::", $name, "` under `module`.")]
+        pub fn define(
+            ruby: &::magnus::Ruby,
+            module: ::magnus::RModule,
+        ) -> Result<(), ::magnus::Error> {
+            use ::magnus::prelude::*;
+            let class = module.define_class($name, ruby.class_object())?;
+            CLASS.set(ruby, ::matryona_machines::ruby::Class::pin(ruby, class))?;
+            class.undef_default_alloc_func();
+            class.define_singleton_method("new", ::magnus::function!(Wrapper::new, $arity))?;
+            class.define_singleton_method("decode", ::magnus::function!(Wrapper::decode, 1))?;
+            $(class.define_method($method, ::magnus::method!(Wrapper::$function, $args))?;)*
+            class.define_method("==", ::magnus::method!(Wrapper::eq, 1))?;
+            class.define_method("encoded", ::magnus::method!(Wrapper::encoded, 0))?;
+            class.define_method("inspect", ::magnus::method!(Wrapper::inspect, 0))?;
+            Ok(())
+        }
+    };
+}
+pub(crate) use define;
+
 mod data;
 mod gcounter;
 mod gset;
@@ -21,7 +111,7 @@ mod pncounter;
 mod shape;
 
 use magnus::{Error, Ruby, Symbol, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, symbol};
+use matryona_machines::ruby::{Symbols, bytes_with, class_name, symbol};
 use merge_machines::Refusal;
 
 /// Where a core frame names the shape it was written at.
@@ -74,12 +164,27 @@ pub(crate) fn refused_frame(ruby: &Ruby, refused: Refusal) -> Error {
     )
 }
 
+/// A frame for `decode`: the bytes of exactly a String, copied natively.
+/// `TypeError` naming the class received (the real class, never an opened
+/// singleton), built only on refusal.
+pub(crate) fn frame_bytes(frame: Value) -> Result<Vec<u8>, Error> {
+    bytes_with(frame, || {
+        format!("frame must be a String, not {}", class_name(frame))
+    })
+}
+
 /// The shape a frame was written at, read from its header.
 pub(crate) fn frame_shape(ruby: &Ruby, frame: &[u8]) -> Result<usize, Error> {
-    let Some(field) = frame.get(SHAPE) else {
+    let Some(field) = shape_field(frame) else {
         return Err(refused_frame(ruby, Refusal::Truncated));
     };
-    Ok(usize::from(u16::from_le_bytes([field[0], field[1]])))
+    Ok(usize::from(u16::from_le_bytes(field)))
+}
+
+/// The two header bytes naming a frame's shape, or `None` for a frame too
+/// short to hold them.
+pub(crate) fn shape_field(frame: &[u8]) -> Option<[u8; 2]> {
+    frame.get(SHAPE).and_then(|field| field.try_into().ok())
 }
 
 pub(crate) fn unsupported(ruby: &Ruby, name: &str, given: usize, supported: &[usize]) -> Error {
@@ -102,5 +207,5 @@ pub(crate) fn expected_message(what: &str, given: Value) -> String {
 /// The `TypeError` message for a partner state of the wrong class, naming
 /// the class received. Built only on refusal.
 pub(crate) fn expected_class(what: &str, given: Value) -> String {
-    format!("expected {what}, got {}", given.class())
+    format!("expected {what}, got {}", class_name(given))
 }

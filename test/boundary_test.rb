@@ -119,21 +119,29 @@ module MergeMachines
       assert_equal 'expected a MergeMachines::GSet, got Integer', error.message
       error = assert_raises(TypeError) { LwwRegister.new(1, 5, 2).merge(nil) }
       assert_equal 'expected a MergeMachines::LwwRegister, got NilClass', error.message
+      opened = PNCounter.new(4).tap { |counter| def counter.opened = true }
+      error = assert_raises(TypeError) { GCounter.new(4).merge(opened) }
+      assert_equal 'expected a MergeMachines::GCounter, got MergeMachines::PNCounter', error.message
     end
 
     # A frame is exactly a String: a subclass, an object answering `to_str`
-    # and a String with a redefined `#bytes` change nothing about that.
+    # and a String with a redefined `#bytes` change nothing about that. The
+    # TypeError names the class received: the real class, never an opened
+    # singleton nor what a redefined `#class` claims.
     def test_a_frame_is_exactly_a_string
-      subclass = Class.new(String)
+      subclass = Class.new(String).new(GCounter.new(4).encoded)
       stringly = Object.new.tap { |o| o.define_singleton_method(:to_str) { GCounter.new(4).encoded } }
+      posing = Object.new.tap { |o| def o.class = String }
+      bad = { subclass => subclass.class.to_s, stringly => 'Object', posing => 'Object',
+              frame: 'Symbol', 1 => 'Integer', nil => 'NilClass' }
       [GCounter.new(4), PNCounter.new(4), GSet.new(64), OrSet.new(64), LwwRegister.new(1, 5, 2),
        LogicalClock.new, HybridClock.new].each do |held|
         state = held.class
         frame = held.encoded
-        error = assert_raises(TypeError) { state.decode(subclass.new(frame)) }
-        assert_equal 'frame must be a String', error.message
-        assert_raises(TypeError) { state.decode(stringly) }
-        assert_raises(TypeError) { state.decode(:frame) }
+        bad.each do |value, received|
+          error = assert_raises(TypeError) { state.decode(value) }
+          assert_equal "frame must be a String, not #{received}", error.message
+        end
         lying = frame.dup.tap { |f| f.define_singleton_method(:bytes) { raise 'the binding ran #bytes' } }
         assert_equal state.decode(frame), state.decode(lying)
       end

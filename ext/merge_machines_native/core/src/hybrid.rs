@@ -1,20 +1,12 @@
 //! A hybrid logical clock: timestamps near physical time that still order.
 
 use crate::{
-    FIELD_LEN, Refusal, STAMP_HYBRID, Stamp, TAG, TAG_HYBRID_CLOCK, TAG_LEN, read_u64, tagged_frame,
+    FIELD_LEN, Reader, Refusal, STAMP_HYBRID, Stamp, TAG_HYBRID_CLOCK, TAG_LEN, Writer,
+    tagged_frame,
 };
 
 /// Bytes a [`HybridTimestamp`] occupies in a frame.
 const TIMESTAMP_LEN: usize = 2 * FIELD_LEN;
-
-/// Where the wall-clock reading sits in a timestamp field.
-const WALL: core::ops::Range<usize> = 0..FIELD_LEN;
-
-/// Where the counter sits in a timestamp field.
-const COUNTER: core::ops::Range<usize> = FIELD_LEN..TIMESTAMP_LEN;
-
-/// Where the last timestamp issued sits in a clock frame.
-const LAST: core::ops::Range<usize> = TAG_LEN..TAG_LEN + TIMESTAMP_LEN;
 
 /// A wall-clock reading paired with a counter that breaks its ties.
 ///
@@ -43,16 +35,18 @@ impl Stamp for HybridTimestamp {
     const KIND: u8 = STAMP_HYBRID;
     const ENCODED_LEN: usize = TIMESTAMP_LEN;
 
-    fn write(self, field: &mut [u8]) {
-        field[WALL].copy_from_slice(&self.wall_ns.to_le_bytes());
-        field[COUNTER].copy_from_slice(&self.counter.to_le_bytes());
+    fn write(self, field: &mut [u8]) -> Result<(), Refusal> {
+        let mut field = Writer::new(field);
+        field.u64(self.wall_ns)?;
+        field.u64(self.counter)
     }
 
-    fn read(field: &[u8]) -> Self {
-        Self {
-            wall_ns: read_u64(&field[WALL]),
-            counter: read_u64(&field[COUNTER]),
-        }
+    fn read(field: &[u8]) -> Result<Self, Refusal> {
+        let mut field = Reader::new(field);
+        Ok(Self {
+            wall_ns: field.u64()?,
+            counter: field.u64()?,
+        })
     }
 }
 
@@ -184,9 +178,9 @@ impl HybridClock {
     encoders!("clock");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame[TAG] = TAG_HYBRID_CLOCK;
-        self.last.write(&mut frame[LAST]);
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_HYBRID_CLOCK)?;
+        self.last.write(frame.take(TIMESTAMP_LEN)?)
     }
 
     /// Reads a clock written by [`encode`](Self::encode).
@@ -209,8 +203,8 @@ impl HybridClock {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_HYBRID_CLOCK)?;
-        self.last = HybridTimestamp::read(&frame[LAST]);
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_HYBRID_CLOCK)?;
+        self.last = HybridTimestamp::read(frame.take(TIMESTAMP_LEN)?)?;
         Ok(())
     }
 }

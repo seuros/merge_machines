@@ -1,8 +1,8 @@
 //! Last writer wins, with the replica id as the tie-break.
 
 use crate::{
-    FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_LWW_REGISTER, read_small,
-    read_u64, small_field, tagged_frame,
+    FIELD_LEN, Merge, Reader, Refusal, ReplicaId, SHAPE_LEN, TAG_LEN, TAG_LWW_REGISTER, Writer,
+    tagged_frame,
 };
 
 /// A stamp naming one 64-bit counter, as [`LogicalClock`](crate::LogicalClock)
@@ -21,36 +21,39 @@ pub trait Stamp: Copy + Default + Ord {
     /// Bytes this stamp occupies in a register frame.
     const ENCODED_LEN: usize;
 
-    /// Writes this stamp into `field`, which is
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN) long.
-    fn write(self, field: &mut [u8]);
+    /// Writes this stamp into the front of `field`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Truncated`] when `field` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    fn write(self, field: &mut [u8]) -> Result<(), Refusal>;
 
-    /// Reads a stamp from `field`, which is
-    /// [`ENCODED_LEN`](Self::ENCODED_LEN) long.
-    fn read(field: &[u8]) -> Self;
+    /// Reads a stamp from the front of `field`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Truncated`] when `field` is shorter than
+    /// [`ENCODED_LEN`](Self::ENCODED_LEN).
+    fn read(field: &[u8]) -> Result<Self, Refusal>;
 }
 
 impl Stamp for u64 {
     const KIND: u8 = STAMP_LOGICAL;
     const ENCODED_LEN: usize = FIELD_LEN;
 
-    fn write(self, field: &mut [u8]) {
-        field.copy_from_slice(&self.to_le_bytes());
+    fn write(self, field: &mut [u8]) -> Result<(), Refusal> {
+        Writer::new(field).u64(self)
     }
 
-    fn read(field: &[u8]) -> Self {
-        read_u64(field)
+    fn read(field: &[u8]) -> Result<Self, Refusal> {
+        Reader::new(field).u64()
     }
 }
 
-/// Where the stamp kind sits in a frame.
-const STAMP_KIND: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
-
-/// Where the value sits in a frame.
-const VALUE: core::ops::Range<usize> = STAMP_KIND.end..STAMP_KIND.end + FIELD_LEN;
-
-/// Where the writing replica sits in a frame.
-const REPLICA: core::ops::Range<usize> = VALUE.end..VALUE.end + FIELD_LEN;
+/// Bytes a frame spends ahead of its stamp: the tag, the stamp kind, the
+/// value and the writing replica, in that order.
+const HEAD_LEN: usize = TAG_LEN + SHAPE_LEN + FIELD_LEN + FIELD_LEN;
 
 /// What an honoured [`LwwRegister::set`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,10 +154,7 @@ impl<T: Clone + PartialEq, S: Ord + Copy> LwwRegister<T, S> {
 
 impl<S: Stamp> LwwRegister<u64, S> {
     /// Length of the [`encode`](Self::encode) frame.
-    pub const ENCODED_LEN: usize = REPLICA.end + S::ENCODED_LEN;
-
-    /// Where the stamp sits in a frame.
-    const STAMP: core::ops::Range<usize> = REPLICA.end..Self::ENCODED_LEN;
+    pub const ENCODED_LEN: usize = HEAD_LEN + S::ENCODED_LEN;
 
     /// A register holding nothing, for [`decode`](Self::decode) to read a frame
     /// over.
@@ -169,12 +169,12 @@ impl<S: Stamp> LwwRegister<u64, S> {
     encoders!("register");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame[TAG] = TAG_LWW_REGISTER;
-        frame[STAMP_KIND].copy_from_slice(&small_field(usize::from(S::KIND)));
-        frame[VALUE].copy_from_slice(&self.value.to_le_bytes());
-        frame[REPLICA].copy_from_slice(&self.replica.to_le_bytes());
-        self.stamp.write(&mut frame[Self::STAMP]);
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_LWW_REGISTER)?;
+        frame.small(usize::from(S::KIND))?;
+        frame.u64(self.value)?;
+        frame.u64(self.replica)?;
+        self.stamp.write(frame.take(S::ENCODED_LEN)?)
     }
 
     /// Reads a register written by [`encode`](Self::encode).
@@ -198,14 +198,17 @@ impl<S: Stamp> LwwRegister<u64, S> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LWW_REGISTER)?;
-        if read_small(&frame[STAMP_KIND]) != usize::from(S::KIND) {
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LWW_REGISTER)?;
+        if frame.small()? != usize::from(S::KIND) {
             return Err(Refusal::WrongShape);
         }
 
-        self.value = read_u64(&frame[VALUE]);
-        self.replica = read_u64(&frame[REPLICA]);
-        self.stamp = S::read(&frame[Self::STAMP]);
+        let value = frame.u64()?;
+        let replica = frame.u64()?;
+        let stamp = S::read(frame.take(S::ENCODED_LEN)?)?;
+        self.value = value;
+        self.replica = replica;
+        self.stamp = stamp;
         Ok(())
     }
 }

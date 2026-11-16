@@ -1,8 +1,8 @@
 //! Observed-remove set: a remove only takes out the adds it has seen.
 
 use crate::{
-    COUNT_LEN, FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_LEN, TAG_ORSET, fill_free,
-    fits_free, read_small, read_u64, same_elements, small_field, tagged_frame,
+    COUNT_LEN, FIELD_LEN, Merge, Reader, Refusal, ReplicaId, SHAPE_LEN, TAG_LEN, TAG_ORSET, Writer,
+    fill_free, fits_free, same_elements, tagged_frame,
 };
 
 /// Bytes one tombstone record occupies: the tag's replica then its counter.
@@ -11,29 +11,9 @@ const TOMBSTONE_LEN: usize = 2 * FIELD_LEN;
 /// Bytes one add record occupies: the element then the tag it came under.
 const ADD_LEN: usize = FIELD_LEN + TOMBSTONE_LEN;
 
-/// Where the element sits in an add record.
-const ELEMENT: core::ops::Range<usize> = 0..FIELD_LEN;
-
-/// Where the tag sits in an add record.
-const TAGGED: core::ops::Range<usize> = FIELD_LEN..ADD_LEN;
-
-/// Where the tag's replica sits in a tombstone record.
-const REPLICA: core::ops::Range<usize> = 0..FIELD_LEN;
-
-/// Where the tag's counter sits in a tombstone record.
-const COUNTER: core::ops::Range<usize> = FIELD_LEN..TOMBSTONE_LEN;
-
-/// Where the shape sits in a frame.
-const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
-
-/// Where the number of records carrying an add sits in a frame.
-const ADDS_HELD: core::ops::Range<usize> = SHAPE.end..SHAPE.end + COUNT_LEN;
-
-/// Where the number of records carrying a tombstone sits in a frame.
-const REMOVES_HELD: core::ops::Range<usize> = ADDS_HELD.end..ADDS_HELD.end + COUNT_LEN;
-
-/// Where the add records start in a frame.
-const ADDS: usize = REMOVES_HELD.end;
+/// Bytes a frame spends ahead of its records: the tag, the shape, then the
+/// number of records carrying an add and the number carrying a tombstone.
+const HEAD_LEN: usize = TAG_LEN + SHAPE_LEN + 2 * COUNT_LEN;
 
 /// Which add a remove is talking about.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -225,32 +205,39 @@ impl<T: Copy + PartialEq, const N: usize> OrSet<T, N> {
 }
 
 impl<const N: usize> OrSet<u64, N> {
-    /// Where the tombstone records start in a frame.
-    const REMOVES: usize = ADDS + N * ADD_LEN;
+    /// Bytes a frame spends on its add records.
+    const ADDS_LEN: usize = N * ADD_LEN;
 
-    /// Length of the [`encode`](Self::encode) frame.
-    pub const ENCODED_LEN: usize = Self::REMOVES + N * TOMBSTONE_LEN;
+    /// Bytes a frame spends on its tombstone records.
+    const REMOVES_LEN: usize = N * TOMBSTONE_LEN;
+
+    /// Length of the [`encode`](Self::encode) frame: the head, the add
+    /// records, then the tombstone records.
+    pub const ENCODED_LEN: usize = HEAD_LEN + Self::ADDS_LEN + Self::REMOVES_LEN;
 
     encoders!("set");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame.fill(0);
-        frame[TAG] = TAG_ORSET;
-        frame[SHAPE].copy_from_slice(&small_field(N));
-        frame[ADDS_HELD].copy_from_slice(&small_field(self.adds().count()));
-        frame[REMOVES_HELD].copy_from_slice(&small_field(self.removes().count()));
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_ORSET)?;
+        frame.small(N)?;
+        frame.small(self.adds().count())?;
+        frame.small(self.removes().count())?;
 
-        let (records, _) = frame[ADDS..Self::REMOVES].as_chunks_mut::<ADD_LEN>();
+        let (records, _) = frame.take(Self::ADDS_LEN)?.as_chunks_mut::<ADD_LEN>();
         for (record, add) in records.iter_mut().zip(self.adds()) {
-            record[ELEMENT].copy_from_slice(&add.element.to_le_bytes());
-            write_tag(add.tag, &mut record[TAGGED]);
+            let mut record = Writer::new(record);
+            record.u64(add.element)?;
+            write_tag(add.tag, &mut record)?;
         }
 
-        let (records, _) = frame[Self::REMOVES..].as_chunks_mut::<TOMBSTONE_LEN>();
+        let (records, _) = frame
+            .take(Self::REMOVES_LEN)?
+            .as_chunks_mut::<TOMBSTONE_LEN>();
         for (record, tag) in records.iter_mut().zip(self.removes()) {
-            write_tag(tag, record);
+            write_tag(tag, &mut Writer::new(record))?;
         }
+        Ok(())
     }
 
     /// Reads a set written by [`encode`](Self::encode).
@@ -276,23 +263,24 @@ impl<const N: usize> OrSet<u64, N> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_ORSET)?;
-        if read_small(&frame[SHAPE]) != N {
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_ORSET)?;
+        if frame.small()? != N {
             return Err(Refusal::WrongShape);
         }
 
-        let adds_held = read_small(&frame[ADDS_HELD]);
-        let removes_held = read_small(&frame[REMOVES_HELD]);
+        let adds_held = frame.small()?;
+        let removes_held = frame.small()?;
         if adds_held > N || removes_held > adds_held {
             return Err(Refusal::Malformed);
         }
 
         let mut set = Self::new();
-        let (records, _) = frame[ADDS..Self::REMOVES].as_chunks::<ADD_LEN>();
+        let (records, _) = frame.take(Self::ADDS_LEN)?.as_chunks::<ADD_LEN>();
         for (slot, record) in set.slots.iter_mut().zip(records.iter().take(adds_held)) {
+            let mut record = Reader::new(record);
             let add = Tagged {
-                element: read_u64(&record[ELEMENT]),
-                tag: read_tag(&record[TAGGED]),
+                element: record.u64()?,
+                tag: read_tag(&mut record)?,
             };
             *slot = Some(Seen {
                 add,
@@ -304,9 +292,9 @@ impl<const N: usize> OrSet<u64, N> {
             return Err(Refusal::Malformed);
         }
 
-        let (records, _) = frame[Self::REMOVES..].as_chunks::<TOMBSTONE_LEN>();
+        let (records, _) = frame.take(Self::REMOVES_LEN)?.as_chunks::<TOMBSTONE_LEN>();
         for record in records.iter().take(removes_held) {
-            match set.seen_mut(read_tag(record)) {
+            match set.seen_mut(read_tag(&mut Reader::new(record))?) {
                 Some(seen) if !seen.removed => seen.removed = true,
                 Some(_) | None => return Err(Refusal::Malformed),
             }
@@ -316,18 +304,19 @@ impl<const N: usize> OrSet<u64, N> {
     }
 }
 
-/// Writes `tag` into `field`, which is [`TOMBSTONE_LEN`] long.
-fn write_tag(tag: Tag, field: &mut [u8]) {
-    field[REPLICA].copy_from_slice(&tag.replica.to_le_bytes());
-    field[COUNTER].copy_from_slice(&tag.counter.to_le_bytes());
+/// Writes `tag` as the next [`TOMBSTONE_LEN`] bytes: its replica, then its
+/// counter.
+fn write_tag(tag: Tag, field: &mut Writer<'_>) -> Result<(), Refusal> {
+    field.u64(tag.replica)?;
+    field.u64(tag.counter)
 }
 
-/// Reads a tag from `field`, which is [`TOMBSTONE_LEN`] long.
-fn read_tag(field: &[u8]) -> Tag {
-    Tag {
-        replica: read_u64(&field[REPLICA]),
-        counter: read_u64(&field[COUNTER]),
-    }
+/// Reads the next [`TOMBSTONE_LEN`] bytes as a tag.
+fn read_tag(field: &mut Reader<'_>) -> Result<Tag, Refusal> {
+    Ok(Tag {
+        replica: field.u64()?,
+        counter: field.u64()?,
+    })
 }
 
 impl<T: Copy + PartialEq, const N: usize> Merge for OrSet<T, N> {

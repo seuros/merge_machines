@@ -1,9 +1,6 @@
 //! Lamport's logical clock: ordering events without reading a clock.
 
-use crate::{FIELD_LEN, Refusal, TAG, TAG_LEN, TAG_LOGICAL_CLOCK, read_u64, tagged_frame};
-
-/// Where the counter sits in a frame.
-const COUNTER: core::ops::Range<usize> = TAG_LEN..TAG_LEN + FIELD_LEN;
+use crate::{FIELD_LEN, Refusal, TAG_LEN, TAG_LOGICAL_CLOCK, Writer, tagged_frame};
 
 /// A counter that orders events across replicas, with no clock involved.
 ///
@@ -85,9 +82,9 @@ impl LogicalClock {
     encoders!("clock");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(self, frame: &mut [u8]) {
-        frame[TAG] = TAG_LOGICAL_CLOCK;
-        frame[COUNTER].copy_from_slice(&self.counter.to_le_bytes());
+    fn write_frame(self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_LOGICAL_CLOCK)?;
+        frame.u64(self.counter)
     }
 
     /// Reads a clock written by [`encode`](Self::encode).
@@ -110,8 +107,8 @@ impl LogicalClock {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LOGICAL_CLOCK)?;
-        self.counter = read_u64(&frame[COUNTER]);
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_LOGICAL_CLOCK)?;
+        self.counter = frame.u64()?;
         Ok(())
     }
 }

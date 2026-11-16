@@ -136,9 +136,9 @@ dependencies = [
 
 [[package]]
 name = "matryona-machines"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8f0f5f3041e6832eb8c13bf58e6908bce06cf13ce9577adca59a6dce2640c4c"
+checksum = "e448feeedb05fc14a41811dbbe56b1189c2ba1e4a46ae3a16b7f43e68810cc5d"
 dependencies = [
  "magnus",
 ]

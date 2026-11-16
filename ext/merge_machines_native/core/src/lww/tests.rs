@@ -1,4 +1,4 @@
-use crate::{HybridTimestamp, LwwRegister, Merge, Refusal, Writing};
+use crate::{HybridTimestamp, LwwRegister, Merge, Refusal, Stamp, Writing};
 use matryona_machines::testing::refuses;
 
 /// The later stamp wins, and an equal stamp is broken by the higher replica,
@@ -88,4 +88,19 @@ fn a_merge_of_two_values_under_one_stamp_is_refused() {
 
     refuses(&mut left, Refusal::Mismatch, |l| l.merge(&right));
     assert_eq!(left.merge(&before), Ok(()));
+}
+
+#[test]
+fn a_stamp_refuses_a_field_too_short_to_hold_it() {
+    let mut short = [0_u8; 15];
+    let stamp = HybridTimestamp::new(7, 9);
+    assert_eq!(stamp.write(&mut short), Err(Refusal::Truncated));
+    assert_eq!(HybridTimestamp::read(&short), Err(Refusal::Truncated));
+    assert_eq!(7_u64.write(&mut short[..7]), Err(Refusal::Truncated));
+    assert_eq!(<u64 as Stamp>::read(&short[..7]), Err(Refusal::Truncated));
+
+    let mut room = [0_u8; 17];
+    assert_eq!(stamp.write(&mut room), Ok(()));
+    assert_eq!(HybridTimestamp::read(&room), Ok(stamp));
+    assert_eq!(room[16], 0, "nothing past the stamp is written");
 }

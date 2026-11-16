@@ -1,30 +1,15 @@
 //! A counter that only goes up, held as one count per replica.
 
 use crate::{
-    COUNT_LEN, FIELD_LEN, Merge, Refusal, ReplicaId, SHAPE_LEN, TAG, TAG_GCOUNTER, TAG_LEN,
-    fill_free, read_small, read_u64, small_field, tagged_frame,
+    COUNT_LEN, FIELD_LEN, Merge, Reader, Refusal, ReplicaId, SHAPE_LEN, TAG_GCOUNTER, TAG_LEN,
+    Writer, fill_free, tagged_frame,
 };
 
 /// Bytes one slot record occupies: the replica id then its count.
 const RECORD_LEN: usize = 2 * FIELD_LEN;
 
-/// Where the replica id sits in a slot record.
-const REPLICA: core::ops::Range<usize> = 0..FIELD_LEN;
-
-/// Where the count sits in a slot record.
-const COUNT: core::ops::Range<usize> = FIELD_LEN..RECORD_LEN;
-
-/// Where the number of records carrying a slot sits in a body.
-const HELD: core::ops::Range<usize> = 0..COUNT_LEN;
-
-/// Where the slot records start in a body.
-const RECORDS: usize = HELD.end;
-
-/// Where the shape sits in a frame.
-const SHAPE: core::ops::Range<usize> = TAG_LEN..TAG_LEN + SHAPE_LEN;
-
-/// Where the body starts in a frame.
-const BODY: usize = SHAPE.end;
+/// Bytes a frame spends ahead of its body: the tag then the shape.
+const HEAD_LEN: usize = TAG_LEN + SHAPE_LEN;
 
 /// One replica's contribution to a [`GCounter`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -136,30 +121,36 @@ impl<const R: usize> GCounter<R> {
     }
 
     /// Length of the [`encode`](Self::encode) frame.
-    pub const ENCODED_LEN: usize = BODY + Self::BODY_LEN;
+    pub const ENCODED_LEN: usize = HEAD_LEN + Self::BODY_LEN;
 
-    /// Length of the slot table a frame carries after its tag and shape.
-    pub(crate) const BODY_LEN: usize = RECORDS + R * RECORD_LEN;
+    /// Length of the slot table a frame carries after its tag and shape: the
+    /// number of records carrying a slot, then the records.
+    pub(crate) const BODY_LEN: usize = COUNT_LEN + Self::RECORDS_LEN;
+
+    /// Bytes a slot table spends on its records.
+    const RECORDS_LEN: usize = R * RECORD_LEN;
 
     encoders!("counter");
 
     /// Fills a frame of exactly [`ENCODED_LEN`](Self::ENCODED_LEN) bytes.
-    fn write_frame(&self, frame: &mut [u8]) {
-        frame[TAG] = TAG_GCOUNTER;
-        frame[SHAPE].copy_from_slice(&small_field(R));
-        self.write_body(&mut frame[BODY..]);
+    fn write_frame(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.byte(TAG_GCOUNTER)?;
+        frame.small(R)?;
+        self.write_body(frame)
     }
 
-    /// Fills a slot table of exactly [`BODY_LEN`](Self::BODY_LEN) bytes.
-    pub(crate) fn write_body(&self, body: &mut [u8]) {
-        body.fill(0);
-        body[HELD].copy_from_slice(&small_field(self.entries().count()));
+    /// Writes the [`BODY_LEN`](Self::BODY_LEN)-byte slot table into a zeroed
+    /// frame, so records past the held ones stay zero.
+    pub(crate) fn write_body(&self, frame: &mut Writer<'_>) -> Result<(), Refusal> {
+        frame.small(self.entries().count())?;
 
-        let (records, _) = body[RECORDS..].as_chunks_mut::<RECORD_LEN>();
+        let (records, _) = frame.take(Self::RECORDS_LEN)?.as_chunks_mut::<RECORD_LEN>();
         for (record, entry) in records.iter_mut().zip(self.entries()) {
-            record[REPLICA].copy_from_slice(&entry.replica.to_le_bytes());
-            record[COUNT].copy_from_slice(&entry.count.to_le_bytes());
+            let mut record = Writer::new(record);
+            record.u64(entry.replica)?;
+            record.u64(entry.count)?;
         }
+        Ok(())
     }
 
     /// Reads a counter written by [`encode`](Self::encode).
@@ -185,32 +176,33 @@ impl<const R: usize> GCounter<R> {
     ///
     /// The same as [`decode`](Self::decode).
     pub fn decode_into(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
-        let frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GCOUNTER)?;
-        if read_small(&frame[SHAPE]) != R {
+        let mut frame = tagged_frame(bytes, Self::ENCODED_LEN, TAG_GCOUNTER)?;
+        if frame.small()? != R {
             return Err(Refusal::WrongShape);
         }
 
-        *self = Self::read_body(&frame[BODY..])?;
+        *self = Self::read_body(&mut frame)?;
         Ok(())
     }
 
-    /// Reads a slot table of exactly [`BODY_LEN`](Self::BODY_LEN) bytes.
+    /// Reads the next [`BODY_LEN`](Self::BODY_LEN)-byte slot table.
     ///
     /// # Errors
     ///
     /// [`Refusal::Malformed`] for a table no sequence of calls produces.
-    pub(crate) fn read_body(body: &[u8]) -> Result<Self, Refusal> {
-        let held = read_small(&body[HELD]);
+    pub(crate) fn read_body(frame: &mut Reader<'_>) -> Result<Self, Refusal> {
+        let held = frame.small()?;
         if held > R {
             return Err(Refusal::Malformed);
         }
-        let (records, _) = body[RECORDS..].as_chunks::<RECORD_LEN>();
+        let (records, _) = frame.take(Self::RECORDS_LEN)?.as_chunks::<RECORD_LEN>();
 
         let mut counter = Self::new();
         for (slot, record) in counter.slots.iter_mut().zip(records.iter().take(held)) {
+            let mut record = Reader::new(record);
             *slot = Some(Entry {
-                replica: read_u64(&record[REPLICA]),
-                count: read_u64(&record[COUNT]),
+                replica: record.u64()?,
+                count: record.u64()?,
             });
         }
         let repeated = |entry: Entry| {

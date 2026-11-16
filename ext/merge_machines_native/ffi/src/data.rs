@@ -8,7 +8,7 @@
 //! mutated never has to find a constant.
 
 use magnus::{Error, RClass, RModule, Ruby, Value, function, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_fields_with, integer};
+use matryona_machines::ruby::{Class, exact_fields_with, integer};
 
 use crate::expected_message;
 use merge_machines::{Entry, HybridTimestamp, Tag, Tagged};
@@ -22,10 +22,9 @@ pub struct Classes {
     pub tagged: Class,
 }
 
-static CLASSES: Registry<Classes> = Registry::new("merge_machines");
-
-pub fn classes(ruby: &Ruby) -> Result<&'static Classes, Error> {
-    CLASSES.get(ruby)
+matryona_machines::registry! {
+    static CLASSES: Classes = "merge_machines";
+    pub fn classes;
 }
 
 pub fn define(ruby: &Ruby, module: RModule) -> Result<(), Error> {

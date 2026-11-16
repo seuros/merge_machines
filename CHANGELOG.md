@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/merge_machines/compare/merge_machines/v0.6.0...merge_machines/v0.6.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([d37c3ad](https://github.com/seuros/merge_machines/commit/d37c3adc64b6760ba34f5bb3e2fccdc9d3180904))
+
 ## [0.6.0](https://github.com/seuros/merge_machines/compare/merge_machines/v0.5.1...merge_machines/v0.6.0) (2026-11-16)
 
 

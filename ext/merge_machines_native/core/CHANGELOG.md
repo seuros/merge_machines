@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/merge_machines/compare/merge-machines-v0.4.0...merge-machines-v0.5.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* make Stamp read/write fallible and walk frames without panics
+
+### Features
+
+* make Stamp read/write fallible and walk frames without panics ([6d0c773](https://github.com/seuros/merge_machines/commit/6d0c773668eb5e44b88ab7c6d50802521bf73a04))
+
 ## [0.4.0](https://github.com/seuros/merge_machines/compare/merge-machines-v0.3.0...merge-machines-v0.4.0) (2026-11-14)
 
 
